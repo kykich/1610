@@ -2420,7 +2420,14 @@ import { apiGet, apiPost } from "./core/api.js";
                        runtime: null, params: {},
                        tunnel: null, engine: "weak",
                        active_label: "", weak_label: "Qwen-2B",
-                       strong_label: "Qwen-9B", pc_models: [], pair: null };
+                       strong_label: "Qwen-9B", pc_models: [], pair: null,
+                       source: "vps", pc_root: "" };
+
+    // Путь ПК: "E:\..." / "E:/..." или UNC "\\server\...".
+    function isPcPath(path) {
+        var p = String(path || "").trim();
+        return /^[A-Za-z]:[\\/]/.test(p) || /^\\\\/.test(p);
+    }
 
     // Читает параметры запуска из полей формы.
     function localParamsFromForm() {
@@ -2505,6 +2512,11 @@ import { apiGet, apiPost } from "./core/api.js";
                 localModelSel.appendChild(o);
             });
             if (curM) localModelSel.value = curM;
+            // После смены источника (VPS <-> ПК) прежний путь может
+            // отсутствовать — выбираем первую доступную модель.
+            if (!localModelSel.value && localModelSel.options.length) {
+                localModelSel.selectedIndex = 0;
+            }
         }
     }
 
@@ -2513,11 +2525,30 @@ import { apiGet, apiPost } from "./core/api.js";
         if (!d) return;
         var wasRunning = localState.running;
         localState.enabled = !!d.enabled;
-        localState.root = d.root || "";
-        localState.server_path = d.server_path || "";
-        localState.models = d.models || [];
-        localState.servers = d.servers || [];
-        localState.running = !!d.running;
+        if (d.pc_result) {
+            // Результат сканирования папки НА ПК.
+            localState.source = "pc";
+            localState.pc_root = d.pc_result.root || localState.pc_root || "";
+            localState.models = d.pc_models || d.pc_result.models || [];
+            localState.servers = d.pc_result.servers || [];
+            localState.server_path = "";
+            localState.pc_scan = d.pc_result;
+        } else if (d.scan) {
+            // Результат локального сканирования VPS.
+            localState.source = "vps";
+            localState.root = d.root || "";
+            localState.server_path = d.server_path || "";
+            localState.models = d.models || [];
+            localState.servers = d.servers || [];
+        } else if (localState.source !== "pc") {
+            localState.root = d.root || "";
+            localState.server_path = d.server_path || "";
+            localState.models = d.models || [];
+            localState.servers = d.servers || [];
+        }
+        localState.running = localState.source === "pc"
+            ? !!((d.tunnel || localState.tunnel || {}).pc_alive)
+            : !!d.running;
         localState.runtime = d.runtime || null;
         if (d.params) localState.params = d.params;
         if (d.tunnel) localState.tunnel = d.tunnel;
@@ -2531,7 +2562,9 @@ import { apiGet, apiPost } from "./core/api.js";
 
         if (localEnabledEl) localEnabledEl.checked = localState.enabled;
         if (localRootEl && document.activeElement !== localRootEl) {
-            localRootEl.value = localState.root || "";
+            localRootEl.value = (localState.source === "pc"
+                ? (localState.pc_root || "")
+                : (localState.root || ""));
         }
         fillLocalSelects();
         // Параметры из снимка (если пришли) — подставляем, не затирая ввод.
@@ -2686,14 +2719,28 @@ import { apiGet, apiPost } from "./core/api.js";
         localScanBtn.addEventListener("click", function () {
             var root = localRootEl ? localRootEl.value.trim() : "";
             if (!root) { setStatus("Укажите путь к папке моделей.", "error"); return; }
+            var pc = isPcPath(root);
+            localState.source = pc ? "pc" : "vps";
+            if (pc) localState.pc_root = root;
             localScanBtn.disabled = true;
             if (localStatusEl) {
-                localStatusEl.textContent = "сканирую папку…";
+                localStatusEl.textContent = pc
+                    ? "сканирую папку НА ПК…" : "сканирую папку…";
                 localStatusEl.className = "local-status warn";
             }
-            localAction("scan", { root: root }, function (d) {
+            localAction(pc ? "pc_scan" : "scan", { root: root }, function (d) {
                 localScanBtn.disabled = false;
-                if (d && d.scan && d.scan.ok) {
+                if (pc) {
+                    var res = (d && d.pc_result) || {};
+                    if (res.error) {
+                        setStatus("ПК-агент недоступен: " +
+                            (res.error || "нет туннеля"), "error");
+                    } else {
+                        setStatus("На ПК найдено моделей: " +
+                            ((res.models || []).length) + ", серверов: " +
+                            ((res.servers || []).length), "ok");
+                    }
+                } else if (d && d.scan && d.scan.ok) {
                     setStatus("Найдено моделей: " + (d.scan.models || []).length +
                               ", серверов: " + (d.scan.servers || []).length, "ok");
                 } else {
@@ -2706,6 +2753,13 @@ import { apiGet, apiPost } from "./core/api.js";
         var saveLocalRoot = function () {
             var root = (localRootEl.value || "").trim();
             if (!root) return;
+            if (isPcPath(root)) {
+                // Путь ПК не сохраняем в настройки VPS-модели.
+                localState.pc_root = root;
+                localState.source = "pc";
+                return;
+            }
+            localState.source = "vps";
             localAction("set", { root: root });
         };
         localRootEl.addEventListener("blur", saveLocalRoot);
@@ -2731,19 +2785,41 @@ import { apiGet, apiPost } from "./core/api.js";
                 localStatusEl.textContent = "запускаю сервер… (загрузка модели)";
                 localStatusEl.className = "local-status warn";
             }
-            setStatus("Локальная модель: запуск сервера…", "");
-            localAction("start", { server_path: localState.server_path,
-                                   params: params }, function () {
+            var pc = localState.source === "pc";
+            setStatus(pc ? "Запускаю модель НА ПК…"
+                         : "Локальная модель: запуск сервера…", "");
+            localAction(pc ? "pc_start" : "start",
+                        { server_path: localState.server_path,
+                          params: params }, function (d) {
                 localStartBtn.disabled = false;
+                if (pc) {
+                    var res = (d && d.pc_start_result) || {};
+                    if (res.ok === false) {
+                        setStatus("Не удалось запустить модель ПК: " +
+                            (res.error || "?"), "error");
+                    } else {
+                        setStatus("Модель ПК запущена, туннель активен.", "ok");
+                    }
+                }
             });
         });
     }
     if (localStopBtn) {
         localStopBtn.addEventListener("click", function () {
             localStopBtn.disabled = true;
-            localAction("stop", null, function () {
+            var pc = localState.source === "pc";
+            localAction(pc ? "pc_stop" : "stop", null, function (d) {
                 localStopBtn.disabled = false;
-                setStatus("Локальная модель остановлена.", "ok");
+                if (pc) {
+                    var res = (d && d.pc_stop_result) || {};
+                    setStatus(res.ok === false
+                        ? "Не удалось остановить модель ПК: " +
+                          (res.error || "?")
+                        : "Модель ПК остановлена, активна слабая (VPS).",
+                        res.ok === false ? "error" : "ok");
+                } else {
+                    setStatus("Локальная модель остановлена.", "ok");
+                }
             });
         });
     }

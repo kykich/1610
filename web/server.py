@@ -2946,6 +2946,15 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 return self._send_json(200, {"ok": True, "params": params})
 
             if action == "start":
+                # Слабая модель VPS всегда работает под systemd. Повторный
+                # запуск не нужен и привёл бы к конфликту порта 8080.
+                runtime = mgr.status()
+                if runtime.get("ready"):
+                    payload = _local_status_payload()
+                    payload["start"] = {"ok": True, "already": True,
+                                        "url": runtime.get("url"),
+                                        "pid": runtime.get("pid")}
+                    return self._send_json(200, payload)
                 params = dict(data.get("params") or {})
                 server_path = str(data.get("server_path")
                                   or mgr.load_settings().get("server_path")
@@ -3039,6 +3048,84 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                     }
                 payload = _local_status_payload()
                 payload["pc_result"] = res
+                models = res.get("models") or []
+                if models:
+                    sug = _agent_api("/params",
+                                     {"model": models[0].get("path")},
+                                     method="POST", timeout=30)
+                    if sug.get("ok"):
+                        payload["suggest"] = sug.get("params")
+                return self._send_json(200, payload)
+
+            if action == "pc_params":
+                model = str(data.get("model") or "").strip()
+                if not model:
+                    return self._send_json(
+                        400, {"ok": False, "error": "модель не указана"})
+                res = _agent_api("/params", {"model": model},
+                                 method="POST", timeout=30)
+                return self._send_json(
+                    200 if res.get("ok") else 400,
+                    {"ok": bool(res.get("ok")), "params": res.get("params"),
+                     "error": res.get("error")})
+
+            if action == "pc_start":
+                # Запуск модели НА ПК по команде из единого блока UI.
+                params = dict(data.get("params") or {})
+                server_path = str(data.get("server_path") or "").strip()
+                scan = _ServerState.pc_scan or {}
+                if not server_path:
+                    for srv in scan.get("servers") or []:
+                        if srv.get("kind") == "llama.cpp":
+                            server_path = srv.get("path")
+                            break
+                model = str(params.get("model") or "").strip()
+                if not model:
+                    models = scan.get("models") or []
+                    if models:
+                        model = models[0].get("path")
+                        params["model"] = model
+                if not server_path or not model:
+                    return self._send_json(400, {
+                        "ok": False,
+                        "error": "сначала укажите путь, просканируйте папку "
+                                 "ПК и выберите модель"})
+                if not params.get("ngl"):
+                    # 0/пусто — автоподбор на ПК (ngl по свободной VRAM).
+                    sug = _agent_api("/params", {"model": model},
+                                     method="POST", timeout=30)
+                    if sug.get("ok"):
+                        for k, v in (sug.get("params") or {}).items():
+                            params[k] = v
+                        params["model"] = model
+                params.setdefault("host", "127.0.0.1")
+                params.setdefault("port", config.LOCAL_PORT)
+                res = _agent_api(
+                    "/start",
+                    {"server_path": server_path, "params": params},
+                    method="POST", timeout=300)
+                up = {}
+                if res.get("ok"):
+                    # Ждём, пока движок ПК станет виден через туннель.
+                    deadline = time.time() + 30
+                    while time.time() < deadline:
+                        if _tunnel_probe().get("alive"):
+                            break
+                        time.sleep(1.0)
+                    up = _activate_strong()
+                    if up.get("ok"):
+                        _start_tunnel_tick()
+                payload = _local_status_payload()
+                payload["pc_start_result"] = res
+                payload["tunnel_result"] = up
+                return self._send_json(200 if res.get("ok") else 400, payload)
+
+            if action == "pc_stop":
+                res = _agent_api("/stop", {}, method="POST", timeout=30)
+                down = _activate_weak()
+                payload = _local_status_payload()
+                payload["pc_stop_result"] = res
+                payload["tunnel_result"] = down
                 return self._send_json(200, payload)
 
             if action == "pair":

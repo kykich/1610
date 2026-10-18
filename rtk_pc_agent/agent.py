@@ -41,6 +41,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -215,6 +216,153 @@ def _ollama_status(port=11434, timeout=3):
         return {"alive": False, "models": [], "error": str(exc), "url": url}
 
 
+class _EngineKeeper:
+    """Запуск/остановка llama-server НА ПК по команде с VPS."""
+
+    def __init__(self, port=8080, timeout=180, root=""):
+        self.port = int(port or 8080)
+        self.timeout = int(timeout or 180)
+        self.root = str(root or "")
+        self.proc = None
+        self._lock = threading.Lock()
+        self.log_path = os.path.join(tempfile.gettempdir(),
+                                     "rtk_llama_server.log")
+
+    def _url(self):
+        return "http://127.0.0.1:%d/v1" % self.port
+
+    def _probe(self):
+        try:
+            req = urllib.request.Request(self._url() + "/models",
+                                         method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception:                          # noqa: BLE001
+            return False
+
+    def _models(self):
+        try:
+            req = urllib.request.Request(self._url() + "/models",
+                                         method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return [str(it.get("id")) for it in (data.get("data") or [])
+                    if isinstance(it, dict) and it.get("id")]
+        except Exception:                          # noqa: BLE001
+            return []
+
+    def _under_root(self, path):
+        if not self.root:
+            return True
+        root = os.path.abspath(os.path.expanduser(self.root))
+        full = os.path.abspath(os.path.expanduser(path))
+        try:
+            return os.path.commonpath([root, full]) == root
+        except ValueError:
+            return False
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def status(self):
+        ready = self._probe()
+        return {"running": bool(self._alive() or ready),
+                "pid": (self.proc.pid if self._alive() else None),
+                "ready": bool(ready),
+                "models": self._models() if ready else [],
+                "url": self._url(), "port": self.port}
+
+    def tail(self, max_chars=2000):
+        try:
+            with open(self.log_path, "rb") as fh:
+                data = fh.read()[-max_chars:]
+            return data.decode("utf-8", "replace")
+        except Exception:                          # noqa: BLE001
+            return ""
+
+
+    def start(self, server_path, params):
+        params = dict(params or {})
+        with self._lock:
+            if self._alive():
+                return {"ok": True, "already": True,
+                        "pid": self.proc.pid, "url": self._url()}
+            if self._probe():
+                return {"ok": True, "already": True, "pid": None,
+                        "url": self._url()}
+            server_path = str(server_path or "").strip()
+            model = str(params.get("model") or "").strip()
+            if not server_path or not os.path.isfile(server_path):
+                return {"ok": False, "error": "сервер не найден: %s"
+                                              % server_path}
+            if not model or not os.path.isfile(model):
+                return {"ok": False, "error": "модель не найдена: %s"
+                                              % model}
+            if not self._under_root(server_path) or not self._under_root(model):
+                return {"ok": False,
+                        "error": "путь вне разрешённой папки моделей"}
+            cmd = [server_path, "-m", model,
+                   "--host", "127.0.0.1", "--port", str(self.port)]
+            try:
+                cmd += ["-c", str(int(params.get("ctx") or 8192))]
+            except (TypeError, ValueError):
+                cmd += ["-c", "8192"]
+            for key, flag in (("ngl", "-ngl"), ("threads", "-t")):
+                try:
+                    cmd += [flag, str(int(params.get(key)))]
+                except (TypeError, ValueError):
+                    pass
+            fa = str(params.get("flash_attn") or "auto").lower()
+            if fa in ("on", "off", "auto"):
+                cmd += ["-fa", fa]
+            if params.get("jinja"):
+                cmd += ["--jinja"]
+            key = str(params.get("api_key") or "").strip()
+            if key:
+                cmd += ["--api-key", key]
+            try:
+                log = open(self.log_path, "ab")
+                self.proc = subprocess.Popen(
+                    cmd, cwd=os.path.dirname(server_path) or None,
+                    stdout=log, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess,
+                                          "CREATE_NO_WINDOW", 0))
+            except Exception as exc:               # noqa: BLE001
+                return {"ok": False, "error": "не удалось запустить: %s"
+                                              % exc}
+            deadline = time.time() + self.timeout
+            while time.time() < deadline:
+                if self.proc.poll() is not None:
+                    return {"ok": False, "error": "процесс завершился",
+                            "log": self.tail()}
+                if self._probe():
+                    return {"ok": True, "pid": self.proc.pid,
+                            "url": self._url(), "model": model}
+                time.sleep(1.0)
+            self.stop()
+            return {"ok": False, "error": "сервер не ответил за %d с"
+                                          % self.timeout,
+                    "log": self.tail()}
+
+    def stop(self):
+        with self._lock:
+            if self.proc is None:
+                return False
+            try:
+                if self.proc.poll() is None:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+                        self.proc.wait(timeout=5)
+            except Exception:                      # noqa: BLE001
+                pass
+            finally:
+                self.proc = None
+            return True
+
+
 class TunnelKeeper:
     """Держит ssh-туннель живым: перезапускает при обрыве."""
 
@@ -272,7 +420,7 @@ class TunnelKeeper:
 # ---------------------------------------------------------------------------
 # Служебный HTTP-API агента (доступен VPS ТОЛЬКО через туннель)
 # ---------------------------------------------------------------------------
-def make_handler(args, state):
+def make_handler(args, state, engine=None):
     """Фабрика обработчика HTTP-API агента."""
 
     class _Handler(BaseHTTPRequestHandler):
@@ -308,20 +456,9 @@ def make_handler(args, state):
                                         "denied": denied})
             if path == "/status":
                 confirmed, denied = state.get()
-                engine = {"port": args.engine_port,
-                          "alive": False, "models": [], "error": None}
-                try:
-                    req = urllib.request.Request(
-                        "http://127.0.0.1:%d/v1/models"
-                        % int(args.engine_port or 8080), method="GET")
-                    with urllib.request.urlopen(req, timeout=3) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                    engine["alive"] = True
-                    engine["models"] = [
-                        str(it.get("id")) for it in (data.get("data") or [])
-                        if isinstance(it, dict) and it.get("id")]
-                except Exception as exc:           # noqa: BLE001
-                    engine["error"] = str(exc)
+                eng = engine.status() if engine is not None else {
+                    "running": False, "ready": False, "models": [],
+                    "url": None, "port": args.engine_port}
                 ollama = (_ollama_status(args.ollama_port)
                           if args.ollama_port else
                           {"alive": False, "models": [],
@@ -329,7 +466,16 @@ def make_handler(args, state):
                 return self._send(200, {
                     "ok": True, "alive": True,
                     "confirmed": confirmed, "denied": denied,
-                    "engine": engine, "ollama": ollama,
+                    "engine": {
+                        "port": args.engine_port,
+                        "alive": bool(eng.get("ready")),
+                        "running": bool(eng.get("running")),
+                        "pid": eng.get("pid"),
+                        "url": eng.get("url"),
+                        "models": eng.get("models") or [],
+                        "error": None,
+                    },
+                    "ollama": ollama,
                     "tunnel": {
                         "engine_port": args.tunnel_port,
                         "agent_port": args.agent_port,
@@ -355,6 +501,41 @@ def make_handler(args, state):
                 data = self._read_json()
                 root = data.get("root") or args.root or ""
                 return self._send(200, _scan_folder(root))
+            if path == "/params":
+                data = self._read_json()
+                model = str(data.get("model") or "").strip()
+                if not model or not os.path.isfile(model):
+                    return self._send(400, {"ok": False,
+                                            "error": "модель не найдена"})
+                try:
+                    from rtk_app.local_server import suggest_params
+                    params = suggest_params(model)
+                except Exception:                  # noqa: BLE001
+                    params = {}
+                params.setdefault("model", model)
+                params.setdefault("host", "127.0.0.1")
+                params.setdefault("port", args.engine_port)
+                params.setdefault("ctx", 8192)
+                params.setdefault("ngl", 99)
+                params.setdefault("threads", 16)
+                params.setdefault("flash_attn", "auto")
+                params.setdefault("jinja", True)
+                return self._send(200, {"ok": True, "params": params})
+            if path == "/start":
+                data = self._read_json()
+                if engine is None:
+                    return self._send(503, {"ok": False,
+                                            "error": "движок недоступен"})
+                res = engine.start(data.get("server_path"),
+                                   data.get("params") or {})
+                return self._send(200 if res.get("ok") else 400, res)
+            if path == "/stop":
+                if engine is None:
+                    return self._send(503, {"ok": False,
+                                            "error": "движок недоступен"})
+                stopped = engine.stop()
+                return self._send(200, {"ok": True, "stopped": stopped,
+                                        "engine": engine.status()})
             if path == "/confirm":
                 data = self._read_json()
                 state.set(bool(data.get("ok")))
@@ -389,6 +570,8 @@ def build_parser():
                    help="локальный порт Ollama ПК (0 — не пробрасывать)")
     p.add_argument("--embed-tunnel-port", type=int, default=11435,
                    help="loopback-порт Ollama на VPS (эмбеддинги RAG)")
+    p.add_argument("--start-timeout", type=int, default=180,
+                   help="таймаут запуска llama-server на ПК (секунд)")
     p.add_argument("--root", default="",
                    help="папка ПК с моделями/серверами (по умолчанию — запрос)")
     p.add_argument("--bind", default="127.0.0.1",
@@ -434,9 +617,10 @@ def main(argv=None):
         return 0
 
     stop = threading.Event()
+    engine = _EngineKeeper(args.engine_port, args.start_timeout, args.root)
 
     # 1) Служебный HTTP-API агента (loopback). VPS достучится только по туннелю.
-    handler = make_handler(args, state)
+    handler = make_handler(args, state, engine)
     httpd = ThreadingHTTPServer((args.bind, args.agent_port), handler)
     t_http = threading.Thread(target=httpd.serve_forever, daemon=True)
     t_http.start()
@@ -461,6 +645,7 @@ def main(argv=None):
         print("\n[PC-AGENT] остановка по Ctrl+C.", flush=True)
     finally:
         stop.set()
+        engine.stop()
         httpd.shutdown()
     return 0
 
