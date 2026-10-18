@@ -141,8 +141,14 @@ python files_cli.py new adr "Выбор SQLite для RAG" --root C:\work\projec
 - VPS: `/opt/rtk1610`, venv `/opt/rtk1610/.venv` (`mcp`, `pypdf`),
   сервис `rtk1610-web` на `127.0.0.1:8001`.
 - Внешний доступ: `https://91.188.213.252:8443/` (nginx → 8001);
-  `8444` — прямой дубль 1610; `1210` остался на `127.0.0.1:8000`
+  `8444` — прямой дубль 1610. `1210` (`rtk-web`) и `llama-server.service`
+  остановлены и `disable`, чтобы не поднимать модель автоматически
   (nginx-бэкап `/etc/nginx/sites-available/rtk.1210.bak`).
+- **Локальная модель VPS управляется пользователем из UI:**
+  путь `/opt/models` → «Сканировать» → выбрать модель и
+  `/usr/local/bin/llama-server` → «Запустить» / «Остановить».
+  При рестарте `rtk1610-web` дочерний llama-server завершается
+  (`KillMode=control-group`), автозапуска нет.
 - ENV: `/etc/rtk1610/rtk-web.env` (600), состояние —
   `/var/lib/rtk1610/session`, RAG — общий `rag_index.db` на все сессии
   (`RTK_SHARED_RAG=1`).
