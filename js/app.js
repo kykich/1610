@@ -2182,6 +2182,12 @@ import { apiGet, apiPost } from "./core/api.js";
     // Статус Ollama-эмбеддингов (через туннель с ПК).
     function renderRagEmbedStatus() {
         if (!ragEmbedStatusEl) return;
+        if (!ragState.enabled) {
+            ragEmbedStatusEl.textContent =
+                "эмбеддинги: RAG выключен — Ollama не используется";
+            ragEmbedStatusEl.className = "rag-status";
+            return;
+        }
         var t = ragState.embed_tunnel || {};
         if (t.alive) {
             ragEmbedStatusEl.textContent = t.model_ready

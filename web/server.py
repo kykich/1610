@@ -869,16 +869,36 @@ def _embed_probe(timeout=None):
     return local_server.probe_embed(timeout=timeout)
 
 
-def _tunnel_payload():
+def _rag_enabled_global():
+    """Включён ли RAG в общих настройках (для выбора: опрашивать Ollama?)."""
+    try:
+        from rtk_app.rag import RagStore
+        return bool(RagStore().load_settings().get("enabled"))
+    except Exception:                              # noqa: BLE001
+        return False
+
+
+def _tunnel_payload(check_embed=None):
     """Состояние туннеля к ПК + эмбеддингов Ollama + активный движок."""
     probe = _tunnel_probe()
     agent = _agent_api("/confirm_status")
     agent_alive = bool(agent.get("ok") or agent.get("alive"))
+    if check_embed is None:
+        check_embed = _rag_enabled_global()
     # /status (движок + Ollama) спрашиваем только если агент реально ответил:
-    # иначе каждый опрос UI ждал бы лишний таймаут.
-    agent_status = _agent_api("/status") if agent_alive else {}
+    # иначе каждый опрос UI ждал бы лишний таймаут. При выключенном RAG
+    # просим агент НЕ опрашивать Ollama (?ollama=0).
+    status_path = "/status?ollama=%d" % (1 if check_embed else 0)
+    agent_status = _agent_api(status_path) if agent_alive else {}
     confirmed = bool(agent.get("confirmed")) if agent_alive else False
-    embed = _embed_probe()
+    if check_embed:
+        embed = _embed_probe()
+    else:
+        # RAG выключен — не трогаем Ollama через туннель.
+        embed = {"alive": False, "models": [], "model_ready": False,
+                 "error": "RAG выключен",
+                 "url": "http://%s:%d" % (config.EMBED_TUNNEL_HOST,
+                                          config.EMBED_TUNNEL_PORT)}
     eng = _ServerState.local_engine
     return {
         "pc_alive": bool(probe.get("alive")),
@@ -1409,15 +1429,25 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # индекса (файлов, чанков, модель эмбеддингов, ошибки) +
             # состояние туннеля к Ollama ПК.
             payload = self.session.rag_status()
-            probe = _embed_probe()
-            payload["embed_tunnel"] = {
-                "alive": bool(probe.get("alive")),
-                "models": probe.get("models") or [],
-                "model_ready": bool(probe.get("model_ready")),
-                "error": probe.get("error"),
-                "url": probe.get("url"),
-                "port": config.EMBED_TUNNEL_PORT,
-            }
+            if payload.get("enabled"):
+                probe = _embed_probe()
+                payload["embed_tunnel"] = {
+                    "alive": bool(probe.get("alive")),
+                    "models": probe.get("models") or [],
+                    "model_ready": bool(probe.get("model_ready")),
+                    "error": probe.get("error"),
+                    "url": probe.get("url"),
+                    "port": config.EMBED_TUNNEL_PORT,
+                }
+            else:
+                # RAG выключен — Ollama не опрашиваем вообще.
+                payload["embed_tunnel"] = {
+                    "alive": False, "models": [], "model_ready": False,
+                    "error": "RAG выключен",
+                    "url": "http://%s:%d" % (config.EMBED_TUNNEL_HOST,
+                                             config.EMBED_TUNNEL_PORT),
+                    "port": config.EMBED_TUNNEL_PORT,
+                }
             return self._send_json(200, payload)
         if path == "/api/local":
             # Состояние блока ЛОКАЛЬНОЙ модели (llama.cpp/Ollama): настройки,
@@ -2118,7 +2148,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # быть быстрой и предсказуемой.
             rag_context, rag_hits = "", []
             try:
-                if self.session.rag.status().get("available"):
+                if (rag_set.get("enabled")
+                        and self.session.rag.status().get("available")):
                     rag_context, rag_hits = self.session.rag.build_context(
                         question, top_k=rag_set.get("top_k"),
                         docs_dir=rag_docs_dir)
@@ -2133,7 +2164,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # Поиск выполняется ВСЕГДА при use_rag=True, даже если общий RAG
             # выключен, — команда должна опираться на базу знаний поддержки.
             rag_context, rag_hits = "", []
-            if support_spec.get("use_rag", True):
+            if support_spec.get("use_rag", True) and rag_set.get("enabled"):
                 rag_query = ((support_state or {}).get("rag_query")
                              or question)
                 rag_context, rag_hits = support_rag_context(
@@ -2870,6 +2901,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return self._send_json(200, status)
 
         if action == "reindex":
+            if not self.session.rag_settings().get("enabled"):
+                return self._send_json(409, {
+                    "ok": False,
+                    "error": "RAG выключен — индексация и Ollama не "
+                             "используются"})
             # Путь для индексации: из запроса или из сохранённых настроек.
             docs_dir = data.get("docs_dir")
             if docs_dir is not None:
@@ -2888,10 +2924,14 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return self._send_json(200, status)
 
         if action == "check":
-            from rtk_app import rag as rag_mod
-            probe = rag_mod.embed_available()
             payload = self.session.rag_status()
-            payload["embed_check"] = probe
+            if not payload.get("enabled"):
+                payload["embed_check"] = {
+                    "ok": False,
+                    "error": "RAG выключен — Ollama не используется"}
+                return self._send_json(200, payload)
+            from rtk_app import rag as rag_mod
+            payload["embed_check"] = rag_mod.embed_available()
             return self._send_json(200, payload)
 
         # action == "state" и всё прочее — отдаём состояние.

@@ -473,10 +473,14 @@ def make_handler(args, state, engine=None):
                 eng = engine.status() if engine is not None else {
                     "running": False, "ready": False, "models": [],
                     "url": None, "port": args.engine_port}
+                # ?ollama=0 — не опрашивать Ollama (RAG выключен).
+                check_ollama = ("ollama=0" not in self.path)
                 ollama = (_ollama_status(args.ollama_port)
-                          if args.ollama_port else
+                          if (args.ollama_port and check_ollama) else
                           {"alive": False, "models": [],
-                           "error": "выключено", "url": None})
+                           "error": "выключено" if not check_ollama
+                                    else "Ollama не настроена",
+                           "url": None})
                 return self._send(200, {
                     "ok": True, "alive": True,
                     "confirmed": confirmed, "denied": denied,
