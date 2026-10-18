@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "docs_dir": "/opt/rtk1610",
+  "top_k": 5,
+  "embed_model": "nomic-embed-text-v2-moe",
+  "chunk_chars": 600,
+  "rewrite": false,
+  "hybrid": true,
+  "hybrid_alpha": 0.6,
+  "pool_mult": 6,
+  "min_score": 0.0,
+  "rerank": "none",
+  "updated": null
+}

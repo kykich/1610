@@ -73,5 +73,13 @@ docs_rag/
 last_resp.json
 sess.json
 
+# --- временные логи/ответы локальных smoke-проверок ---
+tools/_*.out
+tools/_*.err
+tools/_*.json
+tools/_*_test.py
+_vpslocal*.json
+_vpsmodel.json
+
 # --- AI-ревью PR (review_pr.py / GitHub Action) ---
 review.md

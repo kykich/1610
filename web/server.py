@@ -909,7 +909,8 @@ def _pair_payload():
     agent_port = int(getattr(config, "AGENT_PORT", 18081) or 18081)
     ollama_port = int(getattr(config, "OLLAMA_PORT", 11434) or 11434)
     embed_port = int(getattr(config, "EMBED_TUNNEL_PORT", 11435) or 11435)
-    identity = "%USERPROFILE%\\.ssh\\rtk_pc"
+    identity = str(getattr(config, "TUNNEL_IDENTITY", "")
+                   or "%USERPROFILE%\\.ssh\\rtk_pc")
     vps_arg = vps or "rtk@<IP-этого-VPS>"
     command = (
         "python -m rtk_pc_agent --vps %s --identity \"%s\" "

@@ -528,6 +528,9 @@ TUNNEL_PORT = _env_int("RTK_TUNNEL_PORT", 18080)
 AGENT_HOST = _env_str("RTK_AGENT_HOST", "127.0.0.1")
 AGENT_PORT = _env_int("RTK_AGENT_PORT", 18081)
 TUNNEL_SSH = _env_str("RTK_TUNNEL_SSH", "")
+# Путь к приватному ключу ПК для готовой команды в UI.
+TUNNEL_IDENTITY = _env_str(
+    "RTK_TUNNEL_IDENTITY", "%USERPROFILE%\\.ssh\\rtk_pc")
 WEAK_LABEL = _env_str("RTK_WEAK_LABEL", "Qwen-2B")
 STRONG_LABEL = _env_str("RTK_STRONG_LABEL", "Qwen-9B")
 CONFIRM_TIMEOUT = _env_int("RTK_CONFIRM_TIMEOUT", 120)

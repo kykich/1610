@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "root": "/opt/models",
+  "server_path": "/usr/local/bin/llama-server",
+  "params": {
+    "model": "/opt/models/qwen2.5-3b-instruct-q4_k_m.gguf",
+    "ctx": 4096,
+    "ngl": 0,
+    "threads": 2,
+    "port": 8080,
+    "host": "127.0.0.1",
+    "flash_attn": "auto"
+  }
+}
