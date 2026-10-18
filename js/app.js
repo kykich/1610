@@ -2445,9 +2445,13 @@ import { apiGet, apiPost } from "./core/api.js";
     function renderLocalStatus(extraText) {
         if (!localStatusEl) return;
         var parts = [];
-        if (localState.running) {
+        if (localState.source === "pc") {
+            parts.push(localState.running
+                ? "ПК: модель запущена" : "ПК: модель не запущена");
+            parts.push("слабая VPS работает");
+        } else if (localState.running) {
             var rt = localState.runtime || {};
-            parts.push("запущен");
+            parts.push("слабая VPS запущена");
             if (rt.url) parts.push(rt.url);
             if (rt.pid) parts.push("pid " + rt.pid);
             if (rt.ready === false) parts.push("не отвечает");
@@ -2800,6 +2804,8 @@ import { apiGet, apiPost } from "./core/api.js";
                     } else {
                         setStatus("Модель ПК запущена, туннель активен.", "ok");
                     }
+                } else if (d && d.start && d.start.already) {
+                    setStatus("Слабая модель VPS уже работает.", "ok");
                 }
             });
         });
@@ -2817,6 +2823,8 @@ import { apiGet, apiPost } from "./core/api.js";
                           (res.error || "?")
                         : "Модель ПК остановлена, активна слабая (VPS).",
                         res.ok === false ? "error" : "ok");
+                } else if (d && d.stopped === false) {
+                    setStatus("Слабая модель VPS работает постоянно.", "ok");
                 } else {
                     setStatus("Локальная модель остановлена.", "ok");
                 }
