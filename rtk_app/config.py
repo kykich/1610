@@ -531,6 +531,8 @@ TUNNEL_SSH = _env_str("RTK_TUNNEL_SSH", "")
 # Путь к приватному ключу ПК для готовой команды в UI.
 TUNNEL_IDENTITY = _env_str(
     "RTK_TUNNEL_IDENTITY", "%USERPROFILE%\\.ssh\\rtk_pc")
+# Корень папки с моделями НА ПК (для команды агента и скана ПК).
+PC_ROOT = _env_str("RTK_PC_ROOT", "")
 WEAK_LABEL = _env_str("RTK_WEAK_LABEL", "Qwen-2B")
 STRONG_LABEL = _env_str("RTK_STRONG_LABEL", "Qwen-9B")
 CONFIRM_TIMEOUT = _env_int("RTK_CONFIRM_TIMEOUT", 120)

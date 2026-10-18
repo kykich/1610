@@ -911,13 +911,15 @@ def _pair_payload():
     embed_port = int(getattr(config, "EMBED_TUNNEL_PORT", 11435) or 11435)
     identity = str(getattr(config, "TUNNEL_IDENTITY", "")
                    or "%USERPROFILE%\\.ssh\\rtk_pc")
+    pc_root = str(getattr(config, "PC_ROOT", "") or "").strip()
     vps_arg = vps or "rtk@<IP-этого-VPS>"
+    root_arg = (" --root \"%s\"" % pc_root) if pc_root else ""
     command = (
         "python -m rtk_pc_agent --vps %s --identity \"%s\" "
         "--engine-port %d --tunnel-port %d --agent-port %d "
-        "--ollama-port %d --embed-tunnel-port %d"
+        "--ollama-port %d --embed-tunnel-port %d%s"
         % (vps_arg, identity, engine_port, tunnel_port, agent_port,
-           ollama_port, embed_port))
+           ollama_port, embed_port, root_arg))
     script = (
         "$ErrorActionPreference = \"Stop\"\r\n"
         "python -m rtk_pc_agent `\r\n"
@@ -927,13 +929,14 @@ def _pair_payload():
         "  --tunnel-port %d `\r\n"
         "  --agent-port %d `\r\n"
         "  --ollama-port %d `\r\n"
-        "  --embed-tunnel-port %d\r\n"
+        "  --embed-tunnel-port %d%s\r\n"
         % (vps_arg, identity, engine_port, tunnel_port, agent_port,
-           ollama_port, embed_port))
+           ollama_port, embed_port,
+           (" `\r\n  --root \"%s\"" % pc_root) if pc_root else ""))
     return {"vps": vps, "engine_port": engine_port, "tunnel_port": tunnel_port,
             "agent_port": agent_port, "ollama_port": ollama_port,
             "embed_port": embed_port, "identity": identity,
-            "command": command, "script": script}
+            "root": pc_root, "command": command, "script": script}
 
 
 def _activate_strong():
@@ -3012,6 +3015,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 # СКАН ПАПКИ НА ПК: VPS напрямую папку ПК не видит, поэтому
                 # просим ПК-агента просканировать путь и вернуть список.
                 root = str(data.get("root") or "").strip()
+                pc_root = str(getattr(config, "PC_ROOT", "") or "").strip()
+                # Поле «корень папки» в UI на VPS содержит путь VPS
+                # (/opt/models). Для скана ПК подставляем PC_ROOT.
+                if pc_root and (not root or root == config.LOCAL_ROOT):
+                    root = pc_root
                 res = _agent_api("/scan", {"root": root}, method="POST")
                 if res.get("ok") or res.get("models") is not None:
                     _ServerState.pc_scan = {
