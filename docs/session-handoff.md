@@ -144,11 +144,12 @@ python files_cli.py new adr "Выбор SQLite для RAG" --root C:\work\projec
   `8444` — прямой дубль 1610. `1210` (`rtk-web`) и `llama-server.service`
   остановлены и `disable`, чтобы не поднимать модель автоматически
   (nginx-бэкап `/etc/nginx/sites-available/rtk.1210.bak`).
-- **Локальная модель VPS управляется пользователем из UI:**
-  путь `/opt/models` → «Сканировать» → выбрать модель и
-  `/usr/local/bin/llama-server` → «Запустить» / «Остановить».
-  При рестарте `rtk1610-web` дочерний llama-server завершается
-  (`KillMode=control-group`), автозапуска нет.
+- **Слабая модель VPS (`Qwen-2B`) работает всегда:**
+  `llama-server.service` включён, `127.0.0.1:8080`.
+- **Единый блок «Локальная модель»:** путь → «Сканировать» → выбор
+  модели и настроек → «Запустить» / «Остановить». Для пути ПК
+  (`e:/Models/llama`) скан и запуск идут через ПК-агент; для
+  `/opt/models` — локально на VPS. Отдельные кнопки ПК удалены.
 - ENV: `/etc/rtk1610/rtk-web.env` (600), состояние —
   `/var/lib/rtk1610/session`, RAG — общий `rag_index.db` на все сессии
   (`RTK_SHARED_RAG=1`).
