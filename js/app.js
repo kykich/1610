@@ -9,6 +9,7 @@
 */
 /* ---- Подключение модулей (рефакторинг на ES-модули) ------------- */
 import { initSections, autoFitSide } from "./features/sections.js";
+import { initSessionGuard } from "./features/sessionGuard.js";
 import { bus, registry } from "./core/bus.js";
 // Общие DOM-утилиты берём из зависимого модуля core/dom.js
 // (одна реализация на всё приложение, без дублирования).
@@ -2168,13 +2169,32 @@ import { apiGet, apiPost } from "./core/api.js";
     var ragCheckBtn = document.getElementById("rag-check");
     var ragClearBtn = document.getElementById("rag-clear");
     var ragStatusEl = document.getElementById("rag-status");
+    var ragEmbedStatusEl = document.getElementById("rag-embed-status");
 
     // Локальный снимок состояния RAG.
     var ragState = { enabled: false, docs_dir: "", top_k: 5,
                      rewrite: true, hybrid: true, hybrid_alpha: 0.6,
                      pool_mult: 6, min_score: 0, rerank: "none",
                      files: 0, chunks: 0, available: false,
-                     embed_model: "", updated: null };
+                     embed_model: "", updated: null,
+                     embed_tunnel: null };
+
+    // Статус Ollama-эмбеддингов (через туннель с ПК).
+    function renderRagEmbedStatus() {
+        if (!ragEmbedStatusEl) return;
+        var t = ragState.embed_tunnel || {};
+        if (t.alive) {
+            ragEmbedStatusEl.textContent = t.model_ready
+                ? "эмбеддинги: Ollama ПК (туннель) — доступна"
+                : "эмбеддинги: Ollama ПК доступна, но модели нет";
+            ragEmbedStatusEl.className = "rag-status " +
+                (t.model_ready ? "ok" : "warn");
+        } else {
+            ragEmbedStatusEl.textContent =
+                "эмбеддинги: Ollama ПК (туннель) — недоступна";
+            ragEmbedStatusEl.className = "rag-status warn";
+        }
+    }
 
     // Показывает статус RAG: вкл/выкл, число файлов и фрагментов, модель.
     function renderRagStatus(extraText) {
@@ -2214,6 +2234,7 @@ import { apiGet, apiPost } from "./core/api.js";
         if (typeof d.chunks === "number") ragState.chunks = d.chunks;
         if (typeof d.available === "boolean") ragState.available = d.available;
         if (typeof d.embed_model === "string") ragState.embed_model = d.embed_model;
+        if (d.embed_tunnel) ragState.embed_tunnel = d.embed_tunnel;
         if ("updated" in d) ragState.updated = d.updated;
         if (ragEnabledEl) ragEnabledEl.checked = ragState.enabled;
         if (ragDocsDirEl && document.activeElement !== ragDocsDirEl) {
@@ -2243,6 +2264,7 @@ import { apiGet, apiPost } from "./core/api.js";
         } else {
             renderRagStatus();
         }
+        renderRagEmbedStatus();
         refreshSections();
     }
 
@@ -2378,11 +2400,27 @@ import { apiGet, apiPost } from "./core/api.js";
     var localThreadsEl = document.getElementById("local-threads");
     var localPortEl = document.getElementById("local-port");
     var localFlashEl = document.getElementById("local-flash");
+    // --- Туннель к ПК (сильная модель + Ollama-эмбеддинги) ---
+    var localPcScanEl = document.getElementById("local-pc-scan");
+    var localPcTunnelEl = document.getElementById("local-pc-tunnel");
+    var localEngineGroup = document.getElementById("local-engine-group");
+    var localEngineStatusEl = document.getElementById("local-engine-status");
+    var localPcPairEl = document.getElementById("local-pc-pair");
+    var localPairBoxEl = document.getElementById("local-pair-box");
+    var localPairCmdEl = document.getElementById("local-pair-cmd");
+    var localPairCopyEl = document.getElementById("local-pair-copy");
+    var localPairCheckEl = document.getElementById("local-pair-check");
+    var localPairHideEl = document.getElementById("local-pair-hide");
+    var localPairStatusEl = document.getElementById("local-pair-status");
+    var localPairPollTimer = null;
 
     // Локальный снимок состояния блока.
     var localState = { enabled: false, root: "", server_path: "",
                        models: [], servers: [], running: false,
-                       runtime: null, params: {} };
+                       runtime: null, params: {},
+                       tunnel: null, engine: "weak",
+                       active_label: "", weak_label: "Qwen-2B",
+                       strong_label: "Qwen-9B", pc_models: [], pair: null };
 
     // Читает параметры запуска из полей формы.
     function localParamsFromForm() {
@@ -2472,6 +2510,14 @@ import { apiGet, apiPost } from "./core/api.js";
         localState.running = !!d.running;
         localState.runtime = d.runtime || null;
         if (d.params) localState.params = d.params;
+        if (d.tunnel) localState.tunnel = d.tunnel;
+        if (d.engine) localState.engine = d.engine;
+        if (d.active_label) localState.active_label = d.active_label;
+        if (d.weak_label) localState.weak_label = d.weak_label;
+        if (d.strong_label) localState.strong_label = d.strong_label;
+        if (d.pc_models) localState.pc_models = d.pc_models;
+        if (d.pair) localState.pair = d.pair;
+        renderLocalPair(d);
 
         if (localEnabledEl) localEnabledEl.checked = localState.enabled;
         if (localRootEl && document.activeElement !== localRootEl) {
@@ -2520,6 +2566,7 @@ import { apiGet, apiPost } from "./core/api.js";
             if (localFlashEl && s.flash_attn) localFlashEl.value = s.flash_attn;
         }
         renderLocalStatus();
+        renderLocalEngine();
         // Запустили/остановили локальный сервер — обновляем список моделей
         // (Local появляется/исчезает) и он включается по умолчанию.
         if (wasRunning !== localState.running) {
@@ -2538,6 +2585,76 @@ import { apiGet, apiPost } from "./core/api.js";
         return apiPost("/api/local", payload)
             .then(function (d) { if (d) applyLocalState(d); if (done) done(d); return d; })
             .catch(function () { if (done) done(null); return null; });
+    }
+
+    // Отрисовка панели «Поднять сильную модель (ПК)»: команда + статус.
+    function renderLocalPair(d) {
+        var pair = (d && d.pair) || localState.pair;
+        if (pair) localState.pair = pair;
+        if (localPairCmdEl && pair && pair.command) {
+            localPairCmdEl.value = pair.command;
+        }
+        if (!localPairStatusEl) return;
+        var tn = (d && d.tunnel) || localState.tunnel || {};
+        if (tn.pc_alive) {
+            localPairStatusEl.textContent =
+                "ПК подключён — сильная модель доступна.";
+            localPairStatusEl.className = "local-status ok";
+        } else {
+            localPairStatusEl.textContent =
+                "ожидаю запуск ПК-агента на ПК…";
+            localPairStatusEl.className = "local-status warn";
+        }
+    }
+
+    // Фоновый опрос /api/local (action=pair), пока панель открыта.
+    function startLocalPairPoll() {
+        stopLocalPairPoll();
+        localPairPollTimer = setInterval(function () {
+            localAction("pair", null, function (d) {
+                if (d) renderLocalPair(d);
+            });
+        }, 4000);
+    }
+
+    function stopLocalPairPoll() {
+        if (localPairPollTimer) {
+            clearInterval(localPairPollTimer);
+            localPairPollTimer = null;
+        }
+    }
+
+    // Отрисовывает активный движок (слабая/сильная) и доступность туннеля.
+    function renderLocalEngine() {
+        if (!localEngineStatusEl) return;
+        var d = localState.tunnel || {};
+        var eng = d.engine || localState.engine || "weak";
+        var label = d.active_label || (eng === "strong"
+            ? (localState.strong_label || "Qwen-9B")
+            : (localState.weak_label || "Qwen-2B"));
+        var parts = ["активна: " + label];
+        if (d.pc_alive) {
+            parts.push("ПК доступен" + (d.pc_models && d.pc_models.length
+                ? " (" + d.pc_models.length + " мод.)" : ""));
+        } else {
+            parts.push("ПК недоступен");
+        }
+        if (d.confirmed) parts.push("подтверждено");
+        if (d.embed_alive) {
+            parts.push(d.embed_model_ready
+                ? "эмбеддинги: Ollama ПК OK"
+                : "Ollama ПК: нет модели эмбеддингов");
+        }
+        localEngineStatusEl.textContent = parts.join(" · ");
+        localEngineStatusEl.className = "local-status " +
+            (eng === "strong" ? "ok" : "");
+        if (localEngineGroup) {
+            var btns = localEngineGroup.querySelectorAll(".engine-btn");
+            for (var i = 0; i < btns.length; i++) {
+                btns[i].classList.toggle("active",
+                    btns[i].dataset.engine === eng);
+            }
+        }
     }
 
     // Загружает состояние блока при старте страницы.
@@ -2634,6 +2751,138 @@ import { apiGet, apiPost } from "./core/api.js";
             });
         });
 
+    // --- Переключение движка: слабая (VPS) <-> сильная (ПК) ---
+    if (localEngineGroup) {
+        localEngineGroup.addEventListener("click", function (e) {
+            var btn = e.target.closest(".engine-btn");
+            if (!btn) return;
+            var want = btn.dataset.engine;
+            var cur = (localState.tunnel || {}).engine ||
+                localState.engine || "weak";
+            if (want === cur) return;
+            var action = want === "strong" ? "tunnel_up" : "tunnel_down";
+            setStatus(want === "strong"
+                ? "Включаю сильную модель (ПК)…"
+                : "Возвращаю слабую модель (VPS)…", "");
+            localAction(action, null, function (d) {
+                var res = (d && d.tunnel_result) || {};
+                if (res.ok === false) {
+                    setStatus("Не удалось переключить модель: " +
+                        (res.error || "?"), "error");
+                } else {
+                    setStatus(want === "strong"
+                        ? "Активна сильная модель (ПК)."
+                        : "Активна слабая модель (VPS).", "ok");
+                }
+            });
+        });
+    }
+
+    // Сканирование папки НА ПК (VPS просит ПК-агент через служебный API).
+    if (localPcScanEl) {
+        localPcScanEl.addEventListener("click", function () {
+            var root = localRootEl ? localRootEl.value.trim() : "";
+            localPcScanEl.disabled = true;
+            setStatus("Сканирую папку НА ПК…", "");
+            localAction("pc_scan", { root: root }, function (d) {
+                localPcScanEl.disabled = false;
+                var res = (d && d.pc_result) || {};
+                if (res.ok === false || res.error) {
+                    setStatus("ПК-агент недоступен: " +
+                        (res.error || "нет туннеля"), "error");
+                } else {
+                    setStatus("На ПК найдено моделей: " +
+                        ((res.models || []).length) + ", серверов: " +
+                        ((res.servers || []).length), "ok");
+                }
+            });
+        });
+    }
+
+    // «Поднять сильную модель (ПК)»: показать команду и следить за туннелем.
+    if (localPcPairEl) {
+        localPcPairEl.addEventListener("click", function () {
+            if (localPairBoxEl) localPairBoxEl.hidden = false;
+            setStatus("Готовлю команду для ПК…", "");
+            localAction("pair", null, function (d) {
+                if (d) renderLocalPair(d);
+            });
+            startLocalPairPoll();
+        });
+    }
+    if (localPairHideEl) {
+        localPairHideEl.addEventListener("click", function () {
+            if (localPairBoxEl) localPairBoxEl.hidden = true;
+            stopLocalPairPoll();
+        });
+    }
+    if (localPairCopyEl) {
+        localPairCopyEl.addEventListener("click", function () {
+            var cmd = localPairCmdEl ? localPairCmdEl.value : "";
+            if (!cmd) return;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(cmd).then(function () {
+                    setStatus("Команда скопирована — вставьте её в "
+                        + "PowerShell на ПК.", "ok");
+                }).catch(function () {
+                    if (localPairCmdEl) localPairCmdEl.select();
+                    setStatus("Скопируйте команду вручную (Ctrl+C).", "warn");
+                });
+            } else if (localPairCmdEl) {
+                localPairCmdEl.select();
+                setStatus("Скопируйте команду вручную (Ctrl+C).", "warn");
+            }
+        });
+    }
+    if (localPairCheckEl) {
+        localPairCheckEl.addEventListener("click", function () {
+            localPairCheckEl.disabled = true;
+            setStatus("Проверяю подключение ПК…", "");
+            localAction("pair", null, function (d) {
+                localPairCheckEl.disabled = false;
+                if (d) renderLocalPair(d);
+                var tn = (d && d.tunnel) || localState.tunnel || {};
+                if (tn.pc_alive) {
+                    localAction("tunnel_up", null, function (dd) {
+                        var res = (dd && dd.tunnel_result) || {};
+                        if (res.ok === false) {
+                            setStatus("Туннель есть, но включить сильную "
+                                + "модель не удалось: " + (res.error || "?"),
+                                "error");
+                        } else {
+                            setStatus("Готово: активна сильная модель (ПК).",
+                                "ok");
+                            stopLocalPairPoll();
+                            if (localPairBoxEl) localPairBoxEl.hidden = true;
+                        }
+                    });
+                } else {
+                    setStatus("ПК пока не подключился. Запустите команду "
+                        + "на ПК и нажмите «Проверить подключение» ещё раз.",
+                        "warn");
+                }
+            });
+        });
+    }
+
+    // Проверка/подъём туннеля к ПК (включить сильную модель).
+    if (localPcTunnelEl) {
+        localPcTunnelEl.addEventListener("click", function () {
+            localPcTunnelEl.disabled = true;
+            setStatus("Проверяю туннель к ПК…", "");
+            localAction("tunnel_up", null, function (d) {
+                localPcTunnelEl.disabled = false;
+                var res = (d && d.tunnel_result) || {};
+                if (res.ok === false) {
+                    setStatus("Туннель к ПК недоступен: " +
+                        (res.error || "?"), "error");
+                } else {
+                    setStatus("Туннель к ПК активен — сильная модель.", "ok");
+                }
+            });
+        });
+    }
+
     // ------------------------------------------------------------------
     // СЕКЦИИ (сворачивание) и автоподбор ширины панели
     // ------------------------------------------------------------------
@@ -2675,4 +2924,7 @@ import { apiGet, apiPost } from "./core/api.js";
     bus.emit("app:ready", {});
 
     loadSession();
+
+    // Сторож сессии: следит за лимитом мест и завершением сессии.
+    initSessionGuard();
 })();

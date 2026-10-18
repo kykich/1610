@@ -21,11 +21,19 @@ from web import server
 
 def main():
     # 1. Самодиагностика файлов/ключей моделей (с советами).
-    try:
-        reports = key_check.check_all(network=True)
-        key_check.print_report(reports, verbose=True)
-    except Exception as exc:            # на всякий случай не роняем старт
-        print("[ключи] не удалось выполнить проверку:", exc)
+    # На VPS её можно отключить/облегчить:
+    #   RTK_SKIP_KEY_CHECK=1 — совсем не проверять ключи;
+    #   RTK_CHECK_NETWORK=0  — проверять файлы без сетевых запросов.
+    from rtk_app import config
+    if not getattr(config, "SKIP_KEY_CHECK", False):
+        try:
+            reports = key_check.check_all(
+                network=getattr(config, "CHECK_NETWORK", True))
+            key_check.print_report(reports, verbose=True)
+        except Exception as exc:        # на всякий случай не роняем старт
+            print("[ключи] не удалось выполнить проверку:", exc)
+    else:
+        print("[ключи] проверка отключена (RTK_SKIP_KEY_CHECK=1).")
 
     # 2. Запуск сервера (стартует всегда; неготовые модели покажут совет).
     server.main()

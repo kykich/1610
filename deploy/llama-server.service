@@ -1,0 +1,49 @@
+# systemd-юнит для локального движка инференса llama.cpp (CPU-only).
+# См. docs/vps-llm-service.md §4, §10.
+#
+# Установка:
+#   sudo cp deploy/llama-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now llama-server.service
+#
+# Параметры запуска (см. §4.3): loopback, 2 потока, ctx 4096, без GPU,
+# параллелизм 1 (сериализация инференса на 2 vCPU).
+#
+# --api-key храните в файле /etc/rtk/llama.key (права 600, вне git).
+# Здесь ключ читается через EnvironmentFile, чтобы не светить в юните.
+
+[Unit]
+Description=llama.cpp server (local LLM, CPU-only)
+After=network.target
+
+[Service]
+Type=simple
+User=rtk
+Group=rtk
+WorkingDirectory=/opt/rtk
+
+# Ключ движка и путь к модели — из файла окружения (права 600).
+EnvironmentFile=-/etc/rtk/llama.env
+
+# MODEL — путь к .gguf; LLAMA_SERVER — путь к бинарнику; LLAMA_KEY — api-key.
+ExecStart=/bin/sh -c '/usr/local/bin/llama-server \
+  -m "${MODEL}" \
+  --alias "${LLAMA_ALIAS:-local-3b}" \
+  --host 127.0.0.1 --port 8080 \
+  -c ${LLAMA_CTX:-4096} -ngl 0 -t ${LLAMA_THREADS:-2} \
+  -fa auto --jinja --parallel 1 \
+  --api-key "${LLAMA_KEY}"'
+
+Restart=on-failure
+RestartSec=3
+# Страховка от OOM: движок живёт в пределах своего бюджета памяти.
+MemoryMax=3G
+
+# Минимальные привилегии.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

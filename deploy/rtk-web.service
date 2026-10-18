@@ -1,0 +1,68 @@
+# systemd-юнит для app-сервиса (веб-чата). См. docs/vps-llm-service.md §10.
+#
+# Установка:
+#   sudo cp deploy/rtk-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rtk-web.service
+#
+# App слушает ТОЛЬКО loopback; наружу публикует nginx (см. deploy/nginx.conf).
+
+[Unit]
+Description=RTK web chat (app service)
+After=network.target llama-server.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+User=rtk
+Group=rtk
+WorkingDirectory=/opt/rtk
+# StateDirectory=rtk создаёт /var/lib/rtk (владелец User=rtk) при каждом
+# старте сервиса — так папка сессий всегда доступна для записи.
+StateDirectory=rtk
+
+# Настройки сервиса. Ключ облачных моделей не требуется (локальная модель),
+# поэтому проверку ключей отключаем, сетевые проверки — тоже.
+# RTK_LOCAL_* задают подключение к уже запущенному llama-server (общий ключ).
+EnvironmentFile=-/etc/rtk/rtk-web.env
+Environment=RTK_HOST=127.0.0.1
+Environment=RTK_PORT=8000
+Environment=RTK_BEHIND_PROXY=1
+Environment=RTK_OPEN_BROWSER=0
+Environment=RTK_MAX_SESSIONS=8
+Environment=RTK_IDLE_TIMEOUT=60
+Environment=RTK_CHECK_TIMEOUT=30
+# Rate limit НЕ задаём здесь: им управляет /etc/rtk/rtk-web.env
+# (Environment= переопределял бы EnvironmentFile). Дефолт — 10/мин.
+#
+# ПРИОРИТЕТ ВЛАДЕЛЬЦА: задайте RTK_OWNER_TOKEN=<секрет> в /etc/rtk/rtk-web.env
+# (НЕ в этом файле и НЕ в git!). Владелец открывает сайт со ссылкой
+# http://<IP>/?owner=<секрет> — его браузер запоминает cookie, и ему всегда
+# находится слот (при нехватке вытесняется самая старая чужая сессия).
+Environment=RTK_SKIP_KEY_CHECK=1
+Environment=RTK_CHECK_NETWORK=0
+Environment=RTK_LOCAL_HOST=127.0.0.1
+Environment=RTK_LOCAL_PORT=8080
+Environment=RTK_LOCAL_CTX=4096
+Environment=RTK_LOCAL_TIMEOUT=300
+# Папка сессий — ВНЕ репозитория: StateDirectory создаёт её при старте
+# с владельцем User=rtk, поэтому права не «слетают» после git pull и
+# сессии не «залипают» (симптом: 503 «Нет свободной сессии»).
+Environment=RTK_SESSION_DIR=/var/lib/rtk/session
+# Используем venv проекта, если он есть; иначе — системный python3.
+ExecStart=/bin/sh -c 'PY=/opt/rtk/.venv/bin/python; [ -x "$PY" ] || PY=/usr/bin/python3; exec "$PY" rtk_web.py'
+
+Restart=on-failure
+RestartSec=3
+# App-сервис обслуживает запросы и хранит сессии; память небольшая.
+MemoryMax=512M
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/rtk
+
+[Install]
+WantedBy=multi-user.target
+

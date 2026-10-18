@@ -247,6 +247,7 @@
                             <button id="rag-clear" type="button" class="btn-side link">Очистить</button>
                         </div>
                         <span id="rag-status" class="rag-status">RAG выключен</span>
+                        <span id="rag-embed-status" class="rag-status">эмбеддинги: Ollama ПК (туннель) — нет данных</span>
                     </div>
                                         <span class="side-note">модель эмбеддингов — Ollama nomic-embed-text-v2-moe; индексируются PDF (текст), README/docs и код</span>
                 </div>
@@ -280,6 +281,45 @@
                             <button id="local-start" type="button" class="btn-side primary">Запустить</button>
                             <button id="local-stop" type="button" class="btn-side link">Остановить</button>
                             <button id="local-status-btn" type="button" class="btn-side link">Статус</button>
+                        </div>
+                        <!-- Модель для ответов: слабая на VPS или сильная на ПК
+                             через SSH-туннель. -->
+                        <div class="local-engine" id="local-engine-box">
+                            <div class="local-engine-head">Модель для ответов</div>
+                            <div class="local-engine-toggle" id="local-engine-group">
+                                <button type="button" class="engine-btn active"
+                                        data-engine="weak"
+                                        title="Слабая модель на VPS (Qwen-2B)">Слабая (VPS)</button>
+                                <button type="button" class="engine-btn"
+                                        data-engine="strong"
+                                        title="Сильная модель на ПК через SSH-туннель (Qwen-9B)">Сильная (ПК)</button>
+                            </div>
+                            <div class="local-status-row">
+                                <button id="local-pc-scan" type="button" class="btn-side"
+                                        title="Просканировать папку НА ПК через ПК-агент">Сканировать папку ПК</button>
+                            </div>
+                            <button id="local-pc-pair" type="button" class="btn-side primary local-pc-pair"
+                                    title="Показать готовую команду запуска ПК-агента и следить за туннелем">Поднять сильную модель (ПК)</button>
+                            <div id="local-pair-box" class="local-pair-box" hidden>
+                                <div class="local-pair-hint">
+                                    На ПК с сильной моделью откройте <b>PowerShell</b>,
+                                    вставьте эту команду и нажмите Enter. На ПК
+                                    появится окно подтверждения — нажмите «Да».
+                                </div>
+                                <textarea id="local-pair-cmd" class="local-pair-cmd"
+                                          rows="5" readonly></textarea>
+                                <div class="local-status-row">
+                                    <button id="local-pair-copy" type="button" class="btn-side">Скопировать</button>
+                                    <button id="local-pair-check" type="button" class="btn-side">Проверить подключение</button>
+                                    <button id="local-pair-hide" type="button" class="btn-side link">Скрыть</button>
+                                </div>
+                                <span id="local-pair-status" class="local-status">ожидаю запуск ПК-агента…</span>
+                            </div>
+                            <div class="local-status-row">
+                                <button id="local-pc-tunnel" type="button" class="btn-side"
+                                        title="Проверить туннель к ПК и включить сильную модель">Проверить ПК</button>
+                            </div>
+                            <span id="local-engine-status" class="local-status">активна: слабая (VPS)</span>
                         </div>
                         <label class="compact-label side-label">
                             <span>сервер</span>

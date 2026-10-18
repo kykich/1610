@@ -124,6 +124,8 @@ import json
 import mimetypes
 import os
 import re
+import urllib.error
+import urllib.request
 import webbrowser
 import threading
 import time
@@ -135,6 +137,8 @@ from rtk_app import file_tasks
 from rtk_app import local_server
 from rtk_app import support as support_mod
 from rtk_app.session_store import SessionStore
+from web import session_manager as session_mgr
+from web import rate_limit
 
 try:
     # MCP-клиент (опциональная зависимость): сервер проекта должен
@@ -610,6 +614,19 @@ class _ServerState:
     local_runtime = None
     local_lock = threading.Lock()
 
+    # --- ЛОКАЛЬНАЯ LLM С ПК (SSH-ТУННЕЛЬ) ---
+    # Активный движок: "weak" (Qwen-2B на VPS, 127.0.0.1:8080) либо
+    # "strong" (Qwen-9B на ПК, виден как 127.0.0.1:TUNNEL_PORT).
+    local_engine = "weak"
+    # Последний результат сканирования папки НА ПК (служебный API агента).
+    pc_scan = None
+    # Фоновый контроль туннеля (двусторонний авто-возврат weak <-> strong).
+    tunnel_thread = None
+    tunnel_stop = None
+    tunnel_lock = threading.Lock()
+    # VPS: реестр клиентских сессий (лимит активных + автомат состояний).
+    _RTK_VPS_SESSIONS = session_mgr.get_manager()
+
 
 def _mcp_settings_file():
     """Путь к файлу настроек MCP (в папке сессии)."""
@@ -700,13 +717,15 @@ def _local_status_payload():
     """Состояние блока локальной модели для UI.
 
     Включает: настройки (enabled/root/server_path/params), найденные модели
-    и серверы (из последнего сканирования), состояние процесса
-    (running/ready/url/pid) и список моделей запущенного сервера.
+    и серверы (из последнего сканирования), состояние движка
+    (running/ready/url/pid/models), состояние туннеля к ПК и активный движок.
     """
     mgr = _local_manager()
     settings = mgr.load_settings()
-    running = mgr.is_running()
-    runtime = mgr.status() if running else None
+    # Всегда опрашиваем /v1/models: на VPS llama-server поднят systemd,
+    # а не нашим подпроцессом, поэтому is_running() недостаточно.
+    runtime = mgr.status()
+    running = bool(runtime.get("running"))
     scan = _ServerState.local_scan or {}
     return {
         "ok": True,
@@ -717,6 +736,15 @@ def _local_status_payload():
         "models": scan.get("models", []) or [],
         "servers": scan.get("servers", []) or [],
         "managers": scan.get("managers", []) or [],
+        # Модели, найденные НА ПК (удалённый скан через ПК-агент).
+        "pc_models": (_ServerState.pc_scan or {}).get("models", []) or [],
+        "pc_scan": _ServerState.pc_scan or {},
+        # Туннель к ПК + активный движок (слабая/сильная).
+        "tunnel": _tunnel_payload(),
+        "engine": _ServerState.local_engine,
+        "active_label": _active_label(),
+        "weak_label": config.WEAK_LABEL,
+        "strong_label": config.STRONG_LABEL,
         "running": running,
         "runtime": runtime,
     }
@@ -732,10 +760,26 @@ def _sync_agent_local():
     agent = _ServerState.agent
     if agent is None or not hasattr(agent, "set_local_model"):
         return
+
+    # Сильная модель (ПК) активна: не перетираем её слабой настройкой.
+    if _ServerState.local_engine == "strong":
+        probe = _tunnel_probe()
+        models = probe.get("models") or []
+        model_name = models[0] if models else config.STRONG_LABEL
+        agent.set_local_model(url=local_server.tunnel_url(),
+                              model=model_name,
+                              label=config.STRONG_LABEL)
+        return
+
     settings = _local_manager().load_settings()
     enabled = bool(settings.get("enabled"))
     mgr = _local_manager()
-    running = mgr.is_running()
+    runtime = mgr.status()
+    running = runtime.get("running")
+    if running is None:
+        # Совместимость с менеджерами/моками без поля running.
+        running = bool(mgr.is_running()) if hasattr(mgr, "is_running") else True
+    running = bool(running)
     params = settings.get("params") or {}
     url = None
     model_name = None
@@ -745,7 +789,6 @@ def _sync_agent_local():
         url = local_server.server_url(h, p)
         # Имя модели: сначала из /v1/models запущенного сервера, иначе из
         # параметров (basename .gguf без расширения), иначе метка по умолчанию.
-        runtime = mgr.status() if running else {}
         rmodels = runtime.get("models") or []
         if rmodels:
             model_name = rmodels[0]
@@ -765,16 +808,231 @@ def _running_local_label():
     ручного выбора модели в селекторе.
     """
     try:
+        if _ServerState.local_engine == "strong":
+            probe = _tunnel_probe()
+            if probe.get("alive"):
+                return str(config.STRONG_LABEL or "Qwen-9B")
         mgr = _local_manager()
-        if not mgr.is_running():
-            return ""
         status = mgr.status()
-        if not status.get("ready"):
+        running = status.get("running")
+        if running is None:
+            running = bool(mgr.is_running()) if hasattr(mgr, "is_running") else True
+        if not running or not status.get("ready"):
             return ""
         return str(config.LOCAL_LABEL or "Local")
     except Exception as exc:                     # noqa: BLE001
         print("[LOCAL] не удалось определить статус: %s" % exc, flush=True)
         return ""
+
+# ---------------------------------------------------------------------------
+# ЛОКАЛЬНАЯ LLM С ПК ЧЕРЕЗ SSH-ТУННЕЛЬ (Задача 1)
+# ---------------------------------------------------------------------------
+def _active_label():
+    """Имя АКТИВНОЙ модели для UI: слабая (VPS) или сильная (ПК)."""
+    return (config.STRONG_LABEL if _ServerState.local_engine == "strong"
+            else config.WEAK_LABEL)
+
+
+def _agent_api(path, payload=None, method="GET", timeout=None):
+    """Обращается к служебному API ПК-агента (loopback VPS: AGENT_PORT)."""
+    url = "http://%s:%d%s" % (config.AGENT_HOST, config.AGENT_PORT, path)
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method=method)
+    try:
+        with urllib.request.urlopen(
+                req, timeout=timeout
+                or getattr(config, "AGENT_TIMEOUT", 15)) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        return {"ok": False, "alive": False,
+                "error": "агент ПК недоступен: %s" % exc}
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "alive": False, "error": str(exc)}
+
+
+def _tunnel_probe(timeout=None):
+    """Проверяет живость туннеля к ПК (движок сильной модели)."""
+    return local_server.probe_remote(local_server.tunnel_url(),
+                                     timeout=timeout)
+
+
+def _embed_probe(timeout=None):
+    """Проверяет Ollama-эмбеддинги ПК через туннель (GET /api/tags)."""
+    return local_server.probe_embed(timeout=timeout)
+
+
+def _tunnel_payload():
+    """Состояние туннеля к ПК + эмбеддингов Ollama + активный движок."""
+    probe = _tunnel_probe()
+    agent = _agent_api("/confirm_status")
+    agent_alive = bool(agent.get("ok") or agent.get("alive"))
+    # /status (движок + Ollama) спрашиваем только если агент реально ответил:
+    # иначе каждый опрос UI ждал бы лишний таймаут.
+    agent_status = _agent_api("/status") if agent_alive else {}
+    confirmed = bool(agent.get("confirmed")) if agent_alive else False
+    embed = _embed_probe()
+    eng = _ServerState.local_engine
+    return {
+        "pc_alive": bool(probe.get("alive")),
+        "pc_models": probe.get("models") or [],
+        "pc_error": probe.get("error"),
+        "confirmed": confirmed,
+        "agent_alive": agent_alive,
+        "agent_status": agent_status,
+        "embed_alive": bool(embed.get("alive")),
+        "embed_models": embed.get("models") or [],
+        "embed_model_ready": bool(embed.get("model_ready")),
+        "embed_model": config.RAG_EMBED_MODEL,
+        "embed_url": embed.get("url"),
+        "embed_error": embed.get("error"),
+        "embed_port": config.EMBED_TUNNEL_PORT,
+        "engine": eng,
+        "active_label": _active_label(),
+        "weak_label": config.WEAK_LABEL,
+        "strong_label": config.STRONG_LABEL,
+        "tunnel_host": config.TUNNEL_HOST,
+        "tunnel_port": config.TUNNEL_PORT,
+        "agent_port": config.AGENT_PORT,
+    }
+
+
+def _pair_payload():
+    """Готовые команды запуска ПК-агента (для неспециалиста)."""
+    vps = str(getattr(config, "TUNNEL_SSH", "") or "").strip()
+    engine_port = int(getattr(config, "LOCAL_PORT", 8080) or 8080)
+    tunnel_port = int(getattr(config, "TUNNEL_PORT", 18080) or 18080)
+    agent_port = int(getattr(config, "AGENT_PORT", 18081) or 18081)
+    ollama_port = int(getattr(config, "OLLAMA_PORT", 11434) or 11434)
+    embed_port = int(getattr(config, "EMBED_TUNNEL_PORT", 11435) or 11435)
+    identity = "%USERPROFILE%\\.ssh\\rtk_pc"
+    vps_arg = vps or "rtk@<IP-этого-VPS>"
+    command = (
+        "python -m rtk_pc_agent --vps %s --identity \"%s\" "
+        "--engine-port %d --tunnel-port %d --agent-port %d "
+        "--ollama-port %d --embed-tunnel-port %d"
+        % (vps_arg, identity, engine_port, tunnel_port, agent_port,
+           ollama_port, embed_port))
+    script = (
+        "$ErrorActionPreference = \"Stop\"\r\n"
+        "python -m rtk_pc_agent `\r\n"
+        "  --vps %s `\r\n"
+        "  --identity \"%s\" `\r\n"
+        "  --engine-port %d `\r\n"
+        "  --tunnel-port %d `\r\n"
+        "  --agent-port %d `\r\n"
+        "  --ollama-port %d `\r\n"
+        "  --embed-tunnel-port %d\r\n"
+        % (vps_arg, identity, engine_port, tunnel_port, agent_port,
+           ollama_port, embed_port))
+    return {"vps": vps, "engine_port": engine_port, "tunnel_port": tunnel_port,
+            "agent_port": agent_port, "ollama_port": ollama_port,
+            "embed_port": embed_port, "identity": identity,
+            "command": command, "script": script}
+
+
+def _activate_strong():
+    """Включает СИЛЬНУЮ модель (ПК): источник local -> адрес туннеля."""
+    probe = _tunnel_probe()
+    if not probe.get("alive"):
+        return {"ok": False,
+                "error": "туннель к ПК недоступен: %s"
+                         % (probe.get("error") or "нет ответа"),
+                "engine": _ServerState.local_engine}
+    models = probe.get("models") or []
+    model_name = models[0] if models else config.STRONG_LABEL
+    url = local_server.tunnel_url()
+    agent = _ServerState.agent
+    if agent is not None and hasattr(agent, "set_local_model"):
+        agent.set_local_model(url=url, model=model_name,
+                              label=config.STRONG_LABEL)
+    _ServerState.local_engine = "strong"
+    print("[TUNNEL] активна СИЛЬНАЯ модель: %s (%s, model=%r)"
+          % (config.STRONG_LABEL, url, model_name), flush=True)
+    return {"ok": True, "engine": "strong", "url": url,
+            "model": model_name, "label": config.STRONG_LABEL}
+
+
+def _activate_weak():
+    """Возвращает СЛАБУЮ модель (VPS): источник local -> 127.0.0.1:8080."""
+    _ServerState.local_engine = "weak"
+    agent = _ServerState.agent
+    if agent is None or not hasattr(agent, "set_local_model"):
+        return {"ok": True, "engine": "weak", "label": config.WEAK_LABEL}
+    settings = _local_manager().load_settings()
+    params = settings.get("params") or {}
+    h = params.get("host") or config.LOCAL_HOST
+    p = params.get("port") or config.LOCAL_PORT
+    url = local_server.server_url(h, p)
+    runtime = _local_manager().status()
+    rmodels = runtime.get("models") or []
+    if rmodels:
+        model_name = rmodels[0]
+    else:
+        model_path = params.get("model") or ""
+        model_name = (os.path.splitext(os.path.basename(model_path))[0]
+                      if model_path else config.WEAK_LABEL)
+    label = config.LOCAL_LABEL or config.WEAK_LABEL
+    agent.set_local_model(url=url, model=model_name, label=label)
+    print("[TUNNEL] активна СЛАБАЯ модель: %s (%s, model=%r)"
+          % (label, url, model_name), flush=True)
+    return {"ok": True, "engine": "weak", "url": url,
+            "model": model_name, "label": label}
+
+
+def _tunnel_tick_loop(interval, stop_event):
+    """Фоновый контроль туннеля: авто-возврат слабая <-> сильная."""
+    print("[TUNNEL] фоновый контроль туннеля: каждые %d c." % interval,
+          flush=True)
+    while not stop_event.is_set():
+        if stop_event.wait(interval):
+            break
+        try:
+            with _ServerState.tunnel_lock:
+                probe = _tunnel_probe()
+                alive = bool(probe.get("alive"))
+                eng = _ServerState.local_engine
+                if not alive and eng == "strong":
+                    print("[TUNNEL] обрыв туннеля — авто-возврат на слабую "
+                          "(%s)" % config.WEAK_LABEL, flush=True)
+                    _activate_weak()
+                elif alive and eng == "weak":
+                    print("[TUNNEL] туннель восстановлен — авто-возврат на "
+                          "сильную (%s)" % config.STRONG_LABEL, flush=True)
+                    _activate_strong()
+        except Exception as exc:                   # noqa: BLE001
+            print("[TUNNEL] ошибка контроля: %s" % exc, flush=True)
+    print("[TUNNEL] фоновый контроль туннеля остановлен.", flush=True)
+
+
+def _start_tunnel_tick():
+    """Запускает фоновый поток контроля туннеля (если не запущен)."""
+    interval = int(getattr(config, "TUNNEL_CHECK_PERIOD", 0) or 0)
+    if interval <= 0:
+        return
+    if (_ServerState.tunnel_thread
+            and _ServerState.tunnel_thread.is_alive()):
+        return
+    stop = threading.Event()
+    _ServerState.tunnel_stop = stop
+    th = threading.Thread(target=_tunnel_tick_loop, args=(interval, stop),
+                          daemon=True)
+    _ServerState.tunnel_thread = th
+    th.start()
+
+
+def _stop_tunnel_tick():
+    """Останавливает фоновый поток контроля туннеля."""
+    stop = _ServerState.tunnel_stop
+    if stop is not None:
+        stop.set()
+    _ServerState.tunnel_thread = None
+    _ServerState.tunnel_stop = None
+
 
 def _mcp_state_payload(check=False):
     """Собирает состояние MCP для ответа клиенту.
@@ -866,24 +1124,171 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         """Единый агент (rtk_app.agent.Agent), созданный при старте сервера."""
         return _ServerState.agent
 
+    # Какая КЛИЕНТСКАЯ сессия обслуживает текущий запрос (cookie sid).
+    _sid = None
+    _session_obj = None
+    _pending_sid = None
+    _cookie_to_set = None
+    _pending_owner_cookie = None
+
     @property
     def session(self):
-        """Хранилище сессии диалога (rtk_app.session_store.SessionStore)."""
+        """Хранилище сессии ТЕКУЩЕГО клиента (или общая при выключенном лимите)."""
+        if self._session_obj is not None:
+            return self._session_obj
         return _ensure_session()
 
-    def _send_bytes(self, status, body, content_type):
+    def _client_ip(self):
+        """IP клиента: из X-Forwarded-For (за nginx) или из сокета."""
+        if getattr(config, "BEHIND_PROXY", False):
+            xff = self.headers.get("X-Forwarded-For")
+            if xff:
+                return xff.split(",")[0].strip()
+            xr = self.headers.get("X-Real-IP")
+            if xr:
+                return xr.strip()
+        return self.client_address[0] if self.client_address else "?"
+
+    def _rate_limited(self):
+        """Rate limit по IP. True — запрос отклонён (429 уже отправлен)."""
+        if not getattr(config, "RATE_LIMIT_PER_MIN", 0):
+            return False
+        allowed, retry = rate_limit.get_limiter().check(self._client_ip())
+        if allowed:
+            return False
+        payload = json.dumps(
+            {"ok": False,
+             "error": "Слишком часто запросов. Повторите позже."},
+            ensure_ascii=False).encode("utf-8")
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Retry-After", str(retry))
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except Exception:
+            pass
+        return True
+
+    def _read_cookie(self, name):
+        """Читает cookie по имени (или None)."""
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            kv = part.strip().split("=", 1)
+            if len(kv) == 2 and kv[0].strip() == name:
+                return kv[1].strip()
+        return None
+
+    def _read_sid_cookie(self):
+        return self._read_cookie("sid")
+
+    def _is_owner_request(self):
+        """Признак владельца по секретному токену (URL/cookie/заголовок)."""
+        want = str(getattr(config, "OWNER_TOKEN", "") or "").strip()
+        if not want:
+            return (False, None)
+        import urllib.parse
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        url_tok = (q.get("owner", [""])[0] or "").strip()
+        if url_tok:
+            return (url_tok == want, url_tok if url_tok == want else None)
+        cookie_tok = (self._read_cookie(
+            getattr(config, "OWNER_COOKIE", "owner")) or "").strip()
+        if cookie_tok:
+            return (cookie_tok == want, None)
+        hdr = (self.headers.get("X-Owner-Token") or "").strip()
+        if hdr:
+            return (hdr == want, None)
+        return (False, None)
+
+    def _resolve_session(self, is_activity=True, allow_new=True):
+        """Привязывает запрос к клиентской сессии (cookie sid)."""
+        if not getattr(config, "MAX_SESSIONS", 0):
+            self._session_obj = None
+            return "ok"
+        is_owner, url_tok = self._is_owner_request()
+        if url_tok and is_owner:
+            self._pending_owner_cookie = url_tok
+        sid = self._read_sid_cookie()
+        if not allow_new and not sid:
+            self._session_obj = None
+            return "ok"
+        mgr = _ServerState._RTK_VPS_SESSIONS
+        kind, sess = mgr.touch(sid, is_activity=is_activity,
+                               privileged=is_owner)
+        if kind in ("ok", "new") and sess is not None:
+            if kind == "new":
+                self._sid = sess.sid
+                self._pending_sid = sess.sid
+            else:
+                self._sid = sid
+            self._session_obj = sess.store
+            return "ok"
+        self._sid = sid
+        self._session_obj = None
+        return kind
+
+    def _set_sid_cookie(self, sid):
+        self.send_header(
+            "Set-Cookie",
+            "sid=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400" % sid)
+
+    def _set_owner_cookie(self, token):
+        self.send_header(
+            "Set-Cookie",
+            "%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
+            % (getattr(config, "OWNER_COOKIE", "owner"), token))
+
+    def _send_full(self):
+        """Заглушка «нет свободной сессии» (HTTP 503)."""
+        body = (
+            "<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
+            "<meta http-equiv='refresh' content='15'>"
+            "<title>Нет свободной сессии</title>"
+            "<style>body{font-family:sans-serif;background:#1e1e1e;color:#eee;"
+            "display:flex;align-items:center;justify-content:center;"
+            "height:100vh;margin:0}div{max-width:440px;text-align:center;"
+            "padding:24px}a{color:#6cf}</style></head><body><div>"
+            "<h2>Сейчас занято</h2>"
+            "<p>Сервис ограничен (не более %d одновременных сессий). "
+            "Все места заняты — освободится через минуту или раньше.</p>"
+            "<p>Страница обновится автоматически. "
+            "<a href='/'>Повторить сейчас</a></p>"
+            "</div></body></html>"
+        ) % int(getattr(config, "MAX_SESSIONS", 2) or 2)
+        payload = body.encode("utf-8")
+        self.send_response(503)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Retry-After", "15")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except Exception:
+            pass
+
+    def _send_bytes(self, status, body, content_type, set_sid=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(status)
+        if set_sid:
+            self._set_sid_cookie(set_sid)
+        elif self._cookie_to_set:
+            self._set_sid_cookie(self._cookie_to_set)
+            self._cookie_to_set = None
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, status, obj):
+    def _send_json(self, status, obj, set_sid=None):
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self._send_bytes(status, payload, "application/json; charset=utf-8")
+        self._send_bytes(status, payload, "application/json; charset=utf-8",
+                         set_sid=set_sid)
 
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -899,9 +1304,45 @@ class WebRequestHandler(BaseHTTPRequestHandler):
 
     # ---------------- GET ----------------
     def do_GET(self):
+        # Привязка к клиентской сессии (cookie sid). /api/health и статика
+        # доступны всегда; прочие /api/* без слота получают 503.
+        import urllib.parse
+        p = urllib.parse.urlparse(self.path).path
+        if p.startswith("/api/") and p != "/api/health":
+            # /api/heartbeat — «тихий» опрос: не тратит квоту rate limit.
+            if p != "/api/heartbeat" and self._rate_limited():
+                return
+            is_act = (p != "/api/heartbeat")
+            kind = self._resolve_session(is_activity=is_act, allow_new=True)
+            if kind == "full":
+                return self._send_json(503, {"ok": False,
+                    "error": "Нет свободной сессии.", "state": "full"})
+        if p == "/":
+            kind = self._resolve_session(is_activity=True, allow_new=True)
+            if kind == "full":
+                return self._send_full()
+        return self._do_GET()
+
+    def _do_GET(self):
         import urllib.parse
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         if path in ("/", "/index.html"):
+            # Токен владельца пришёл в URL (?owner=...): запомним в cookie и
+            # очистим адресную строку, чтобы секрет не оставался в истории.
+            if self._pending_owner_cookie:
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self._set_owner_cookie(self._pending_owner_cookie)
+                self._pending_owner_cookie = None
+                if self._pending_sid:
+                    self._set_sid_cookie(self._pending_sid)
+                    self._pending_sid = None
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self._pending_sid:
+                self._cookie_to_set = self._pending_sid
+                self._pending_sid = None
             return self._serve_static_safe("index.html")
         if path.startswith(("/css/", "/js/")):
             return self._serve_static_safe(path.lstrip("/"))
@@ -914,6 +1355,16 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # Отдача ИЗОБРАЖЕНИЯ из хранилища RAG (встроенные картинки PDF) —
             # для блока «Фрагмент документа» в карточке ответа.
             return self._serve_rag_image(path[len("/images/"):])
+        if path == "/api/health":
+            info = _ServerState._RTK_VPS_SESSIONS.info()
+            return self._send_json(200, {
+                "ok": True, "service": "rtk-web",
+                "sessions": info,
+                "agent": bool(self.agent),
+            })
+        if path == "/api/heartbeat":
+            hb = _ServerState._RTK_VPS_SESSIONS.heartbeat(self._sid)
+            return self._send_json(200, {"ok": True, "session": hb})
         if path == "/api/model":
             return self._send_json(200, {
                 "ok": True,
@@ -941,8 +1392,19 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return self._send_json(200, _mcp_state_payload(check=False))
         if path == "/api/rag":
             # Состояние RAG: настройки (enabled/docs_dir/top_k) + статистика
-            # индекса (файлов, чанков, модель эмбеддингов, ошибки).
-            return self._send_json(200, self.session.rag_status())
+            # индекса (файлов, чанков, модель эмбеддингов, ошибки) +
+            # состояние туннеля к Ollama ПК.
+            payload = self.session.rag_status()
+            probe = _embed_probe()
+            payload["embed_tunnel"] = {
+                "alive": bool(probe.get("alive")),
+                "models": probe.get("models") or [],
+                "model_ready": bool(probe.get("model_ready")),
+                "error": probe.get("error"),
+                "url": probe.get("url"),
+                "port": config.EMBED_TUNNEL_PORT,
+            }
+            return self._send_json(200, payload)
         if path == "/api/local":
             # Состояние блока ЛОКАЛЬНОЙ модели (llama.cpp/Ollama): настройки,
             # найденные модели/серверы, состояние процесса, URL сервера.
@@ -950,6 +1412,28 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "Not Found"})
 
     def do_POST(self):
+        import urllib.parse
+        if self._rate_limited():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        # /api/newchat обрабатывается ОСОБО: он должен работать даже когда
+        # текущая сессия offline (кнопка «Начать новую сессию»), ротация
+        # слота выполняется внутри _handle_newchat.
+        if path == "/api/newchat":
+            return self._handle_newchat()
+        if path == "/api/newslot":
+            return self._handle_newchat(force_renew=True)
+        kind = self._resolve_session(is_activity=True, allow_new=True)
+        if kind == "full":
+            return self._send_json(503, {"ok": False,
+                "error": "Нет свободной сессии.", "state": "full"})
+        if kind == "offline":
+            return self._send_json(409, {"ok": False,
+                "error": "Сессия завершена. Откройте новую.",
+                "state": "offline"})
+        return self._do_POST()
+
+    def _do_POST(self):
         import urllib.parse
         if urllib.parse.urlparse(self.path).path == "/api/ask":
             return self._handle_ask()
@@ -994,11 +1478,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         ctype, _ = mimetypes.guess_type(full)
         with open(full, "rb") as f:
             body = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype or "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # _send_bytes сам выставит Set-Cookie sid для новой сессии.
+        self._send_bytes(200, body, ctype or "application/octet-stream")
 
     def _serve_rag_doc(self, rel):
         """Отдаёт PDF из папки RAG-документов по имени файла.
@@ -1325,6 +1806,32 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             "usage": result.get("usage"),
             "error": result.get("error"),
         }
+
+    def _handle_newchat(self, force_renew=False):
+        """POST /api/newchat — новый разговор.
+
+        renew=true (или /api/newslot) — выдать НОВЫЙ cookie sid и освободить
+        прежний слот (кнопка «Начать новую сессию», обновление страницы).
+        """
+        data = self._read_json_body() or {}
+        renew = force_renew or bool(data.get("renew"))
+        if not renew or not getattr(config, "MAX_SESSIONS", 0):
+            self.session.reset()
+            return self._send_json(200, {"ok": True,
+                                         "messages": self.session.snapshot()})
+        is_owner, _ = self._is_owner_request()
+        mgr = _ServerState._RTK_VPS_SESSIONS
+        old_sid = self._read_sid_cookie()
+        kind, sid = mgr.new_slot(old_sid=old_sid, privileged=is_owner)
+        if kind != "new" or not sid:
+            return self._send_json(503, {"ok": False,
+                "error": "Нет свободной сессии.", "state": "full"})
+        self._sid = sid
+        self._session_obj = mgr.store_for(sid)
+        self.session.reset()
+        return self._send_json(200, {"ok": True, "renewed": True,
+                                     "messages": self.session.snapshot()},
+                               set_sid=sid)
 
     def _handle_ask(self):
         """Принимает запрос пользователя и передаёт его агенту.
@@ -2500,6 +3007,55 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 _sync_agent_local()
                 return self._send_json(200, _local_status_payload())
 
+            if action == "pc_scan":
+                # СКАН ПАПКИ НА ПК: VPS напрямую папку ПК не видит, поэтому
+                # просим ПК-агента просканировать путь и вернуть список.
+                root = str(data.get("root") or "").strip()
+                res = _agent_api("/scan", {"root": root}, method="POST")
+                if res.get("ok") or res.get("models") is not None:
+                    _ServerState.pc_scan = {
+                        "models": res.get("models") or [],
+                        "servers": res.get("servers") or [],
+                        "root": root,
+                    }
+                payload = _local_status_payload()
+                payload["pc_result"] = res
+                return self._send_json(200, payload)
+
+            if action == "pair":
+                # Подготовка подключения к ПК (команда запуска агента).
+                payload = _local_status_payload()
+                payload["pair"] = _pair_payload()
+                payload["tunnel"] = _tunnel_payload()
+                return self._send_json(200, payload)
+
+            if action == "tunnel_up":
+                # Включить СИЛЬНУЮ модель (ПК).
+                up = _activate_strong()
+                if up.get("ok"):
+                    _start_tunnel_tick()
+                payload = _local_status_payload()
+                payload["tunnel_result"] = up
+                return self._send_json(200, payload)
+
+            if action == "tunnel_down":
+                # Вернуть СЛАБУЮ модель (VPS).
+                _stop_tunnel_tick()
+                down = _activate_weak()
+                payload = _local_status_payload()
+                payload["tunnel_result"] = down
+                return self._send_json(200, payload)
+
+            if action == "confirm_status":
+                res = _agent_api("/confirm_status")
+                return self._send_json(200, {"ok": True, "confirm": res,
+                                             "tunnel": _tunnel_payload()})
+
+            if action == "embed_status":
+                probe = _embed_probe()
+                return self._send_json(200, {"ok": True, "embed": probe,
+                                             "tunnel": _tunnel_payload()})
+
             # action == "state" и всё прочее.
             return self._send_json(200, _local_status_payload())
 
@@ -2515,7 +3071,12 @@ def create_server(agent, host=None, port=None):
     # на общем порту config.WEB_PORT.
     addr = (host or config.WEB_HOST,
             config.WEB_PORT if port is None else port)
-    return ThreadingHTTPServer(addr, WebRequestHandler)
+
+    class _ReusableServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    return _ReusableServer(addr, WebRequestHandler)
 
 
 def _open_browser_later(url, delay=1.0):
@@ -2545,6 +3106,9 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
     if not isinstance(agent, Agent):
         agent = Agent(agent)
 
+    # ВАЖНО: запоминаем агента ДО синхронизации локальной модели.
+    _set_agent(agent)
+
     # ЛОКАЛЬНАЯ МОДЕЛЬ: если она была включена в прошлой сессии — добавляем
     # её источник в состав агента (появится в селекторе моделей).
     try:
@@ -2553,6 +3117,24 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
         print("[LOCAL] не удалось подключить локальную модель: %s" % exc,
               flush=True)
 
+    # VPS: фоновый сборщик клиентских сессий (ACTIVE->CHECK->OFFLINE).
+    try:
+        session_mgr.get_manager()
+        session_mgr.start_gc_thread()
+    except Exception as exc:                       # noqa: BLE001
+        print("[SESSION] gc-поток не запущен: %s" % exc, flush=True)
+
+    # ЛОКАЛЬНАЯ LLM С ПК: если туннель уже поднят — включаем сильную модель,
+    # иначе слабую. Фоновый контроль обеспечивает двусторонний авто-возврат.
+    try:
+        if _tunnel_probe().get("alive"):
+            _activate_strong()
+        else:
+            _activate_weak()
+        _start_tunnel_tick()
+    except Exception as exc:                       # noqa: BLE001
+        print("[TUNNEL] авто-инициализация не удалась: %s" % exc, flush=True)
+
     httpd = create_server(agent, host, port)
     shown_host, shown_port = httpd.server_address[:2]
     url = "http://%s:%s/" % (shown_host, shown_port)
@@ -2560,7 +3142,7 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
     print("[WEB] Агент обслуживает модели: %s" % agent.label)
     _ServerState.composition_running = False
     print("[MCP] доступны серверы: project, support, files", flush=True)
-    if open_page:
+    if open_page and getattr(config, "OPEN_BROWSER", True):
         _open_browser_later(url)
     print("[WEB] Остановка: нажмите Ctrl+C.")
     try:
@@ -2568,6 +3150,7 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
     except KeyboardInterrupt:
         print("\n[WEB] Остановка...")
     finally:
+        _stop_tunnel_tick()
         httpd.server_close()
 
 

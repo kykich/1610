@@ -1,0 +1,71 @@
+# systemd-юнит для app-сервиса 1610 (веб-чат + RAG + MCP + туннель к ПК).
+#
+# Установка:
+#   sudo cp deploy/rtk1610-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rtk1610-web.service
+#
+# App слушает ТОЛЬКО loopback; наружу публикует nginx (deploy/nginx-rtk1610.conf).
+# Секреты (LLAMA_KEY и т.п.) — в /etc/rtk1610/rtk-web.env, права 600.
+
+[Unit]
+Description=RTK 1610 web chat (app service)
+After=network.target llama-server.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+User=rtk
+Group=rtk
+WorkingDirectory=/opt/rtk1610
+# StateDirectory создаёт /var/lib/rtk1610 с владельцем User=rtk.
+StateDirectory=rtk1610
+
+EnvironmentFile=-/etc/rtk1610/rtk-web.env
+Environment=RTK_HOST=127.0.0.1
+Environment=RTK_PORT=8001
+Environment=RTK_BEHIND_PROXY=1
+Environment=RTK_OPEN_BROWSER=0
+Environment=RTK_MAX_SESSIONS=8
+Environment=RTK_IDLE_TIMEOUT=60
+Environment=RTK_CHECK_TIMEOUT=30
+Environment=RTK_SKIP_KEY_CHECK=1
+Environment=RTK_CHECK_NETWORK=0
+Environment=RTK_SHARED_RAG=1
+Environment=RTK_LOCAL_HOST=127.0.0.1
+Environment=RTK_LOCAL_PORT=8080
+Environment=RTK_LOCAL_CTX=4096
+Environment=RTK_LOCAL_TIMEOUT=300
+Environment=RTK_LOCAL_LABEL=Qwen-2B
+Environment=RTK_WEAK_LABEL=Qwen-2B
+Environment=RTK_STRONG_LABEL=Qwen-9B
+Environment=RTK_TUNNEL_HOST=127.0.0.1
+Environment=RTK_TUNNEL_PORT=18080
+Environment=RTK_AGENT_HOST=127.0.0.1
+Environment=RTK_AGENT_PORT=18081
+Environment=RTK_EMBED_TUNNEL_PORT=11435
+Environment=RAG_EMBED_URL=http://127.0.0.1:11435/api/embeddings
+Environment=RAG_EMBED_MODEL=nomic-embed-text-v2-moe
+Environment=RAG_EMBED_DIM=768
+Environment=RAG_EMBED_TIMEOUT=120
+Environment=RAG_REWRITE=0
+Environment=RAG_RERANK=none
+Environment=RTK_RAG_DOCS_DIR=/opt/rtk1610
+# Папка сессий — ВНЕ репозитория (git pull не ломает права).
+Environment=RTK_SESSION_DIR=/var/lib/rtk1610/session
+# Используем venv проекта, если он есть; иначе — системный python3.
+ExecStart=/bin/sh -c 'PY=/opt/rtk1610/.venv/bin/python; [ -x "$PY" ] || PY=/usr/bin/python3; exec "$PY" rtk_web.py'
+
+Restart=on-failure
+RestartSec=3
+# RAG-индексация в памяти Python + SQLite; 1G с запасом.
+MemoryMax=1G
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/rtk1610
+
+[Install]
+WantedBy=multi-user.target

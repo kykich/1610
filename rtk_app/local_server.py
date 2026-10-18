@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from . import config
@@ -47,6 +48,9 @@ __all__ = [
     "suggest_params",
     "build_command",
     "server_url",
+    "tunnel_url",
+    "probe_remote",
+    "probe_embed",
 ]
 
 
@@ -334,6 +338,73 @@ def server_url(host, port):
                                 int(port or config.LOCAL_PORT))
 
 
+def tunnel_url():
+    """URL движка ПК, проброшенного reverse-SSH-туннелем на loopback VPS."""
+    return server_url(getattr(config, "TUNNEL_HOST", "127.0.0.1"),
+                      getattr(config, "TUNNEL_PORT", 18080))
+
+
+def _auth_headers(api_key=None):
+    """Заголовки для llama-server с --api-key (если ключ задан)."""
+    key = str(api_key if api_key is not None
+              else getattr(config, "LOCAL_API_KEY", "") or "").strip()
+    headers = {}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    return headers
+
+
+def probe_remote(url=None, timeout=None, api_key=None):
+    """Проверяет живость удалённого движка (GET /v1/models с Bearer).
+
+    Возвращает dict {alive, models, error, url}. Используется для туннеля
+    к сильной модели ПК: локально VPS папку ПК не видит, но движок доступен
+    как 127.0.0.1:<TUNNEL_PORT>.
+    """
+    base = (url or tunnel_url()).rstrip("/")
+    try:
+        req = urllib.request.Request(base + "/models", method="GET",
+                                     headers=_auth_headers(api_key))
+        with urllib.request.urlopen(
+                req, timeout=timeout
+                or getattr(config, "TUNNEL_PROBE_TIMEOUT", 4)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        items = data.get("data") or []
+        models = [str(it.get("id")) for it in items
+                  if isinstance(it, dict) and it.get("id")]
+        return {"alive": True, "models": models, "error": None, "url": base}
+    except Exception as exc:                       # noqa: BLE001
+        return {"alive": False, "models": [], "error": str(exc), "url": base}
+
+
+def probe_embed(url=None, model=None, timeout=None):
+    """Проверяет Ollama-эмбеддинги через туннель (GET /api/tags).
+
+    Возвращает dict {alive, models, model_ready, error, url}. Это лёгкая
+    проверка (без вычисления вектора); для полной проверки используется
+    rag.embed_available().
+    """
+    base = (url or "http://%s:%d" % (
+        getattr(config, "EMBED_TUNNEL_HOST", "127.0.0.1"),
+        getattr(config, "EMBED_TUNNEL_PORT", 11435))).rstrip("/")
+    want = str(model or getattr(config, "RAG_EMBED_MODEL", "") or "").strip()
+    try:
+        req = urllib.request.Request(base + "/api/tags", method="GET")
+        with urllib.request.urlopen(
+                req, timeout=timeout
+                or getattr(config, "EMBED_PROBE_TIMEOUT", 5)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        names = [str(it.get("name") or it.get("model") or "")
+                 for it in (data.get("models") or []) if isinstance(it, dict)]
+        names = [n for n in names if n]
+        ready = any(n == want or n.split(":", 1)[0] == want for n in names)
+        return {"alive": True, "models": names, "model_ready": ready,
+                "error": None, "url": base}
+    except Exception as exc:                       # noqa: BLE001
+        return {"alive": False, "models": [], "model_ready": False,
+                "error": str(exc), "url": base}
+
+
 # ---------------------------------------------------------------------------
 # Менеджер процесса
 # ---------------------------------------------------------------------------
@@ -456,11 +527,16 @@ class LocalServerManager:
                     "error": None, "model": model}
 
     @staticmethod
-    def _probe_ready(url):
-        """Проверяет готовность сервера: GET <url>/models (OpenAI-совместимо)."""
+    def _probe_ready(url, api_key=None):
+        """Проверяет готовность сервера: GET <url>/models (OpenAI-совместимо).
+
+        Если задан API-ключ (llama-server --api-key), отправляем Bearer:
+        иначе защищённый сервер вернёт 401 и мы ошибочно решим «не готов».
+        """
         try:
-            req = urllib.request.Request(url.rstrip("/") + "/models",
-                                         method="GET")
+            req = urllib.request.Request(
+                url.rstrip("/") + "/models", method="GET",
+                headers=_auth_headers(api_key))
             with urllib.request.urlopen(req, timeout=3) as resp:
                 return resp.status == 200
         except Exception:
@@ -498,27 +574,34 @@ class LocalServerManager:
             return True
 
     def status(self, host=None, port=None):
-        """Текущий статус: запущен ли, URL, PID, ответ сервера (models)."""
-        running = self.is_running()
-        st = {"running": running, "pid": (self._proc.pid if running else None),
-              "url": None, "ready": False, "models": [], "error": None}
+        """Текущий статус: запущен ли, URL, PID, ответ сервера (models).
+
+        ВАЖНО (VPS): llama-server может быть запущен ВНЕШНИМ systemd-сервисом,
+        а не нашим подпроцессом. Поэтому готовность определяем не только по
+        self._proc, но и по фактическому ответу /v1/models.
+        """
+        own_running = self.is_running()
         settings = self.load_settings()
         params = settings.get("params") or {}
         h = host or params.get("host") or config.LOCAL_HOST
         p = port or params.get("port") or config.LOCAL_PORT
-        st["url"] = server_url(h, p)
-        if running:
-            st["ready"] = self._probe_ready(st["url"])
-            if st["ready"]:
-                st["models"] = self._list_server_models(st["url"])
+        url = server_url(h, p)
+        ready = self._probe_ready(url)
+        models = self._list_server_models(url) if ready else []
+        st = {"running": bool(own_running or ready),
+              "pid": (self._proc.pid if own_running else None),
+              "url": url, "ready": bool(ready),
+              "models": models, "error": None,
+              "external": bool(ready and not own_running)}
         return st
 
     @staticmethod
     def _list_server_models(url):
         """Список моделей от локального сервера (GET /v1/models -> data[].id)."""
         try:
-            req = urllib.request.Request(url.rstrip("/") + "/models",
-                                         method="GET")
+            req = urllib.request.Request(
+                url.rstrip("/") + "/models", method="GET",
+                headers=_auth_headers())
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             items = data.get("data") or []

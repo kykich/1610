@@ -426,3 +426,134 @@ LOCAL_TIMEOUT = 180
 LOCAL_START_TIMEOUT = 180
 # Сколько свободной видеопамяти (МБ) оставлять в запасе при автоподборе -ngl.
 LOCAL_VRAM_RESERVE_MB = 512
+
+
+# ===========================================================================
+# ENV-КОНФИГ (VPS / серверный режим)
+# ===========================================================================
+# Значения ниже переопределяют дефолты только если соответствующая переменная
+# окружения задана и не пуста. Локальный запуск без ENV работает как раньше.
+#
+#   RTK_HOST=127.0.0.1            app слушает loopback, наружу прячет nginx
+#   RTK_PORT=8000                 внутренний порт app
+#   RTK_OPEN_BROWSER=0            на сервере браузер не открываем
+#   RTK_BEHIND_PROXY=1            доверять X-Forwarded-For
+#   RTK_SESSION_DIR=...           папка сессий вне репозитория
+#   RTK_MAX_SESSIONS=8            лимит активных сессий (0 = выключить)
+#   RTK_IDLE_TIMEOUT=60           ACTIVE -> CHECK
+#   RTK_CHECK_TIMEOUT=30          CHECK -> OFFLINE
+#   RTK_RATE_LIMIT_PER_MIN=10     запросов/мин на IP (0 = выключить)
+#   RTK_OWNER_TOKEN=<секрет>      приоритетный слот владельца
+#   RTK_SHARED_RAG=1              один индекс RAG на все сессии
+#   RTK_LOCAL_HOST/PORT/API_KEY   уже запущенный llama-server (systemd)
+#   RTK_WEAK_LABEL=Qwen-2B        слабая модель VPS
+#   RTK_STRONG_LABEL=Qwen-9B      сильная модель ПК (через туннель)
+#   RTK_TUNNEL_HOST/PORT          loopback-адрес движка ПК на VPS
+#   RTK_AGENT_HOST/PORT           loopback-адрес служебного API ПК-агента
+#   RTK_EMBED_TUNNEL_PORT=11435   loopback-порт Ollama ПК на VPS
+#   RAG_EMBED_URL=...             эндпоинт эмбеддингов (Ollama через туннель)
+
+
+def _env_str(name, default=""):
+    """Строка из ENV; пустое значение -> default."""
+    val = os.environ.get(name)
+    if val is None or str(val).strip() == "":
+        return default
+    return str(val)
+
+
+def _env_int(name, default):
+    """Целое из ENV; пусто/ошибка -> default."""
+    val = os.environ.get(name)
+    if val is None or str(val).strip() == "":
+        return default
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name, default):
+    """Булево из ENV: 1/true/yes/on -> True."""
+    val = os.environ.get(name)
+    if val is None or str(val).strip() == "":
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+# --- Web / сервер ---
+WEB_HOST = _env_str("RTK_HOST", WEB_HOST)
+WEB_PORT = _env_int("RTK_PORT", WEB_PORT)
+OPEN_BROWSER = _env_bool("RTK_OPEN_BROWSER", True)
+BEHIND_PROXY = _env_bool("RTK_BEHIND_PROXY", False)
+SKIP_KEY_CHECK = _env_bool("RTK_SKIP_KEY_CHECK", False)
+CHECK_NETWORK = _env_bool("RTK_CHECK_NETWORK", True)
+
+# --- Сессии (VPS) ---
+SESSION_DIR = _env_str("RTK_SESSION_DIR", SESSION_DIR)
+SESSION_FILE = os.path.join(SESSION_DIR, "session.json")
+PROFILES_FILE = os.path.join(SESSION_DIR, "profiles.json")
+MCP_SETTINGS_FILE = os.path.join(SESSION_DIR, "mcp.json")
+LOCAL_SETTINGS_FILE = os.path.join(SESSION_DIR, "local_model.json")
+RAG_SETTINGS_FILE = os.path.join(SESSION_DIR, "rag.json")
+RAG_INDEX_FILE = os.path.join(SESSION_DIR, "rag_index.db")
+RAG_IMAGES_DIR = os.path.join(SESSION_DIR, "rag_images")
+
+# 0 — лимит выключен (локальный режим, одна общая сессия как раньше).
+MAX_SESSIONS = _env_int("RTK_MAX_SESSIONS", 0)
+IDLE_TIMEOUT = _env_int("RTK_IDLE_TIMEOUT", 60)
+CHECK_TIMEOUT = _env_int("RTK_CHECK_TIMEOUT", 30)
+SESSION_GC_PERIOD = _env_int("RTK_SESSION_GC_PERIOD", 30)
+OWNER_TOKEN = _env_str("RTK_OWNER_TOKEN", "")
+OWNER_COOKIE = "owner"
+# 1 — один общий индекс RAG для всех клиентских сессий (нужно на VPS).
+SHARED_RAG = _env_bool("RTK_SHARED_RAG", False)
+
+# --- Ограничения запросов ---
+RATE_LIMIT_PER_MIN = _env_int("RTK_RATE_LIMIT_PER_MIN", 0)
+MAX_QUESTION_CHARS = _env_int("RTK_MAX_QUESTION_CHARS", 8000)
+MAX_BODY_BYTES = _env_int("RTK_MAX_BODY_BYTES", 256 * 1024)
+
+# --- Локальная модель VPS (внешний llama-server) ---
+LOCAL_HOST = _env_str("RTK_LOCAL_HOST", LOCAL_HOST)
+LOCAL_PORT = _env_int("RTK_LOCAL_PORT", LOCAL_PORT)
+LOCAL_CTX = _env_int("RTK_LOCAL_CTX", LOCAL_CTX)
+LOCAL_API_KEY = _env_str("RTK_LOCAL_API_KEY", LOCAL_API_KEY)
+LOCAL_LABEL = _env_str("RTK_LOCAL_LABEL", LOCAL_LABEL)
+LOCAL_TIMEOUT = _env_int("RTK_LOCAL_TIMEOUT", LOCAL_TIMEOUT)
+
+# --- Туннель к сильной модели ПК ---
+TUNNEL_HOST = _env_str("RTK_TUNNEL_HOST", "127.0.0.1")
+TUNNEL_PORT = _env_int("RTK_TUNNEL_PORT", 18080)
+AGENT_HOST = _env_str("RTK_AGENT_HOST", "127.0.0.1")
+AGENT_PORT = _env_int("RTK_AGENT_PORT", 18081)
+TUNNEL_SSH = _env_str("RTK_TUNNEL_SSH", "")
+WEAK_LABEL = _env_str("RTK_WEAK_LABEL", "Qwen-2B")
+STRONG_LABEL = _env_str("RTK_STRONG_LABEL", "Qwen-9B")
+CONFIRM_TIMEOUT = _env_int("RTK_CONFIRM_TIMEOUT", 120)
+TUNNEL_CHECK_PERIOD = _env_int("RTK_TUNNEL_CHECK_PERIOD", 20)
+AGENT_TIMEOUT = _env_int("RTK_AGENT_TIMEOUT", 2)
+TUNNEL_PROBE_TIMEOUT = _env_int("RTK_TUNNEL_PROBE_TIMEOUT", 2)
+
+# --- Ollama-эмбеддинги через туннель с ПК ---
+# Порт Ollama НА ПК (нужен только для команды запуска ПК-агента).
+OLLAMA_PORT = _env_int("RTK_OLLAMA_PORT", 11434)
+EMBED_TUNNEL_HOST = _env_str("RTK_EMBED_TUNNEL_HOST", "127.0.0.1")
+EMBED_TUNNEL_PORT = _env_int("RTK_EMBED_TUNNEL_PORT", 11435)
+EMBED_PROBE_TIMEOUT = _env_int("RTK_EMBED_PROBE_TIMEOUT", 5)
+# По умолчанию — локальная Ollama на этом же хосте (11434). На VPS
+# переопределяется на loopback-порт туннеля к Ollama ПК (11435).
+RAG_EMBED_URL = _env_str(
+    "RAG_EMBED_URL", "http://127.0.0.1:11434/api/embeddings")
+RAG_EMBED_MODEL = _env_str("RAG_EMBED_MODEL", RAG_EMBED_MODEL)
+RAG_EMBED_DIM = _env_int("RAG_EMBED_DIM", RAG_EMBED_DIM)
+RAG_EMBED_TIMEOUT = _env_int("RAG_EMBED_TIMEOUT", RAG_EMBED_TIMEOUT)
+RAG_REWRITE = _env_bool("RAG_REWRITE", RAG_REWRITE)
+RAG_RERANK = _env_str("RAG_RERANK", RAG_RERANK)
+RAG_HYBRID = _env_bool("RAG_HYBRID", RAG_HYBRID)
+RAG_MIN_SCORE = float(_env_str("RAG_MIN_SCORE", str(RAG_MIN_SCORE)))
+RAG_DOCS_DIR = _env_str("RTK_RAG_DOCS_DIR", RAG_DOCS_DIR)
+# Куда клонировать git-репозитории для RAG (index_repo).
+RAG_REPO_DIR = _env_str("RTK_RAG_REPO_DIR",
+                        os.path.join(SESSION_DIR, "repos"))
+

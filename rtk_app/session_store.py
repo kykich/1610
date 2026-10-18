@@ -64,12 +64,16 @@ VALID_STRATEGIES = ("none", "sliding", "facts", "branch")
 class SessionStore:
     """Потокобезопасное хранилище одного активного диалога в JSON-файле."""
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, shared_rag=False):
         # path — путь к ФАЙЛУ СЕССИИ (легаси-формат). Если задан явно (напр.
         # во временном файле тестов), профили хранятся в ТОМ ЖЕ файле — так
         # каждый тест изолирован. Если path не задан (продакшн) — профили
         # идут в config.PROFILES_FILE, а легаси-сессия — в config.SESSION_FILE.
+        # shared_rag=True — использовать ОДИН общий индекс RAG
+        # (config.RAG_INDEX_FILE) вместо индекса рядом с файлом сессии.
+        # Нужно на VPS: у всех клиентов один индекс проекта.
         explicit_path = path is not None
+        self.shared_rag = bool(shared_rag)
         self.path = path or config.SESSION_FILE
         self.lock = threading.RLock()
         self.messages = []
@@ -113,7 +117,7 @@ class SessionStore:
         # профильные: они общие для сервера (как MCP), поэтому хранятся
         # отдельно от профилей. При вызове во временном файле (тесты) держим
         # индекс рядом с ним, чтобы тесты не трогали продакшн-индекс.
-        if explicit_path:
+        if explicit_path and not self.shared_rag:
             base = os.path.splitext(self.path)[0]
             self.rag = RagStore(index_file=base + "_rag.db",
                                 settings_file=base + "_rag.json")

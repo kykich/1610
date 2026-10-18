@@ -1840,3 +1840,76 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
     font-family: ui-monospace, Consolas, monospace;
     word-break: break-word;
 }
+
+/* Задача 1: переключатель движка «слабая (VPS) / сильная (ПК)». */
+.local-engine {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px dashed #2a3350;
+}
+.local-engine-head {
+    font-size: .68rem;
+    color: #9fb4e6;
+}
+.local-engine-toggle {
+    display: flex;
+    gap: 6px;
+}
+.local-engine-toggle .engine-btn {
+    flex: 1 1 0;
+    padding: 5px 6px;
+    font-size: .7rem;
+    border: 1px solid #35406a;
+    border-radius: 6px;
+    background: #1a2033;
+    color: #b9c4dc;
+    cursor: pointer;
+}
+.local-engine-toggle .engine-btn:hover { border-color: #4d5c92; }
+.local-engine-toggle .engine-btn.active {
+    background: #2b6cb0;
+    border-color: #3b82f6;
+    color: #fff;
+    font-weight: 600;
+}
+
+/* Задача 1, «Вариант А»: панель подключения ПК для неспециалиста. */
+.local-pc-pair {
+    width: 100%;
+    margin-top: 2px;
+}
+.local-pair-box {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+    padding: 8px;
+    border: 1px solid #35406a;
+    border-radius: 8px;
+    background: #141a2b;
+}
+.local-pair-hint {
+    font-size: .66rem;
+    line-height: 1.35;
+    color: #9fb4e6;
+}
+.local-pair-cmd {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: .66rem;
+    line-height: 1.3;
+    color: #d7e0f5;
+    background: #0d1220;
+    border: 1px solid #2a3350;
+    border-radius: 6px;
+    padding: 6px;
+}
+.local-pair-box .local-status-row {
+    flex-wrap: wrap;
+}
+
