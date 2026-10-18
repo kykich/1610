@@ -2243,6 +2243,9 @@ import { apiGet, apiPost } from "./core/api.js";
         if (d.embed_tunnel) ragState.embed_tunnel = d.embed_tunnel;
         if ("updated" in d) ragState.updated = d.updated;
         if (ragEnabledEl) ragEnabledEl.checked = ragState.enabled;
+        // При выключенном RAG индексация/проверка Ollama недоступны.
+        if (ragReindexBtn) ragReindexBtn.disabled = !ragState.enabled;
+        if (ragCheckBtn) ragCheckBtn.disabled = !ragState.enabled;
         if (ragDocsDirEl && document.activeElement !== ragDocsDirEl) {
             ragDocsDirEl.value = ragState.docs_dir || "";
         }
