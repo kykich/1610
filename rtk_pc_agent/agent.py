@@ -297,6 +297,9 @@ class _EngineKeeper:
             if not server_path or not os.path.isfile(server_path):
                 return {"ok": False, "error": "сервер не найден: %s"
                                               % server_path}
+            if os.name == "nt" and not server_path.lower().endswith(".exe"):
+                return {"ok": False,
+                        "error": "на Windows сервер должен быть .exe"}
             if not model or not os.path.isfile(model):
                 return {"ok": False, "error": "модель не найдена: %s"
                                               % model}
