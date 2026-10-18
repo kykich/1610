@@ -2475,12 +2475,22 @@ import { apiGet, apiPost } from "./core/api.js";
         if (localServerSel) {
             var cur = localState.server_path || localServerSel.value || "";
             localServerSel.innerHTML = "";
+            var hasCur = false;
             (localState.servers || []).forEach(function (s) {
                 var o = document.createElement("option");
                 o.value = s.path;
                 o.textContent = (s.kind || "") + ": " + (s.name || s.path);
                 localServerSel.appendChild(o);
+                if (s.path === cur) hasCur = true;
             });
+            // Сервер может быть вне корня моделей (например,
+            // /usr/local/bin/llama-server на VPS) — показываем его отдельно.
+            if (cur && !hasCur) {
+                var oc = document.createElement("option");
+                oc.value = cur;
+                oc.textContent = "llama.cpp: " + cur;
+                localServerSel.appendChild(oc);
+            }
             if (cur) localServerSel.value = cur;
             localState.server_path = localServerSel.value || "";
         }

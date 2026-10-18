@@ -326,7 +326,10 @@ def build_command(server_path, params):
         cmd += ["-fa", fa]
     if params.get("jinja"):
         cmd += ["--jinja"]
-    key = str(params.get("api_key") or "").strip()
+    # Ключ: явный параметр, иначе — общий RTK_LOCAL_API_KEY из ENV.
+    # Так секрет не нужно хранить в local_model.json.
+    key = str(params.get("api_key")
+              or getattr(config, "LOCAL_API_KEY", "") or "").strip()
     if key:
         cmd += ["--api-key", key]
     return cmd

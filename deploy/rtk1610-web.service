@@ -10,8 +10,10 @@
 
 [Unit]
 Description=RTK 1610 web chat (app service)
-After=network.target llama-server.service
-Wants=llama-server.service
+# Локальную модель (llama-server) запускает и останавливает ПОЛЬЗОВАТЕЛЬ
+# из UI (путь -> сканирование -> запуск). Отдельный llama-server.service
+# для 1610 НЕ требуется и не должен запускаться автоматически.
+After=network.target
 
 [Service]
 Type=simple
@@ -58,8 +60,11 @@ ExecStart=/bin/sh -c 'PY=/opt/rtk1610/.venv/bin/python; [ -x "$PY" ] || PY=/usr/
 
 Restart=on-failure
 RestartSec=3
-# RAG-индексация в памяти Python + SQLite; 1G с запасом.
-MemoryMax=1G
+# В cgroup сервиса живёт и дочерний llama-server (запускается из UI),
+# поэтому лимит должен вмещать модель 3B + Python/RAG.
+MemoryMax=3G
+# При остановке/рестарте сервиса завершаем и дочерний llama-server.
+KillMode=control-group
 
 NoNewPrivileges=true
 PrivateTmp=true
