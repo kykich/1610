@@ -274,8 +274,6 @@
                         </label>
                         <div class="local-status-row">
                             <button id="local-scan" type="button" class="btn-side">Сканировать</button>
-                            <button id="local-start" type="button" class="btn-side primary">Запустить</button>
-                            <button id="local-stop" type="button" class="btn-side link">Остановить</button>
                             <button id="local-status-btn" type="button" class="btn-side link">Статус</button>
                         </div>
                         <!-- Единый сценарий: путь -> сканирование -> выбор
@@ -324,9 +322,13 @@
                             </label>
                         </div>
                         <div id="local-suggest" class="local-suggest" hidden></div>
+                        <div class="local-status-row">
+                            <button id="local-start" type="button" class="btn-side primary">Запустить</button>
+                            <button id="local-stop" type="button" class="btn-side link">Остановить</button>
+                        </div>
                         <span id="local-status" class="local-status">локальная модель не запущена</span>
                     </div>
-                    <span class="side-note">llama.cpp / Ollama / LM Studio; ngl=0 — автоподбор по видеопамяти, запуск и остановка вручную</span>
+                    <span class="side-note">слабая VPS работает всегда; для ПК: путь → «Сканировать» → модель и настройки → «Запустить»</span>
                 </div>
             </section>
 
