@@ -783,7 +783,10 @@ def _sync_agent_local():
     params = settings.get("params") or {}
     url = None
     model_name = None
-    if enabled or running:
+    # Источник Local добавляем ТОЛЬКО если сервер реально готов.
+    # Флаг enabled может остаться true после рестарта сервиса, но процесс
+    # пользователь ещё не запустил — модель не должна быть доступна.
+    if running:
         h = params.get("host") or config.LOCAL_HOST
         p = params.get("port") or config.LOCAL_PORT
         url = local_server.server_url(h, p)
@@ -973,6 +976,13 @@ def _activate_weak():
     p = params.get("port") or config.LOCAL_PORT
     url = local_server.server_url(h, p)
     runtime = _local_manager().status()
+    if not runtime.get("ready"):
+        # Пользователь ещё не запустил локальную модель VPS.
+        agent.set_local_model(url=None, model=None,
+                              label=config.WEAK_LABEL)
+        return {"ok": False, "engine": "weak",
+                "error": "локальная модель VPS не запущена — нажмите "
+                         "«Запустить» в блоке «Локальная модель»"}
     rmodels = runtime.get("models") or []
     if rmodels:
         model_name = rmodels[0]

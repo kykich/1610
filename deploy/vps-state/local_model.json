@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "root": "/opt/models",
   "server_path": "/usr/local/bin/llama-server",
   "params": {
@@ -9,6 +9,7 @@
     "threads": 2,
     "port": 8080,
     "host": "127.0.0.1",
-    "flash_attn": "auto"
+    "flash_attn": "auto",
+    "jinja": true
   }
 }
