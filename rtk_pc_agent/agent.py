@@ -78,8 +78,10 @@ def _scan_folder(root):
             low = fn.lower()
             full = os.path.join(dirpath, fn)
             stem = os.path.splitext(low)[0]
-            # Серверы (исполняемые файлы).
-            if stem in _SERVER_NAMES and low.endswith((".exe", "")):
+            # Серверы (исполняемые файлы). .bat/.cmd — обёртки, они
+            # порождают дочерний процесс и мешают корректной остановке.
+            if (stem in _SERVER_NAMES
+                    and (low.endswith(".exe") or "." not in low)):
                 kind = "ollama" if "ollama" in stem else (
                     "lmstudio" if "lmstudio" in stem or "lm-studio" in stem
                     else "llama.cpp")
@@ -350,7 +352,16 @@ class _EngineKeeper:
                 return False
             try:
                 if self.proc.poll() is None:
-                    self.proc.terminate()
+                    if os.name == "nt":
+                        # /T — завершить дерево процессов (llama-server и
+                        # возможные дочерние), /F — принудительно.
+                        subprocess.run(
+                            ["taskkill", "/PID", str(self.proc.pid),
+                             "/T", "/F"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=15)
+                    else:
+                        self.proc.terminate()
                     try:
                         self.proc.wait(timeout=10)
                     except subprocess.TimeoutExpired:

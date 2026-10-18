@@ -3107,7 +3107,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 up = {}
                 if res.get("ok"):
                     # Ждём, пока движок ПК станет виден через туннель.
-                    deadline = time.time() + 30
+                    deadline = time.time() + 60
                     while time.time() < deadline:
                         if _tunnel_probe().get("alive"):
                             break
