@@ -86,6 +86,21 @@
   `/embed/scan|start|stop|status`. Для RAG обязателен `--ollama-port 11434`.
 - Тест: `python -m tests.check_embed` (61 OK).
 
+## 2b. Политика запуска моделей (19.10.2026)
+
+- По умолчанию на VPS активна **только слабая модель** `Qwen-2B`
+  (`llama-server.service`); `rtk1610-web` при старте больше не переключается
+  на сильную модель, даже если туннель ПК уже поднят.
+- Фоновый контроль туннеля только **возвращает на слабую** при обрыве;
+  автоматического weak → strong нет (`RTK_AUTO_STRONG=0`), переключение —
+  действием пользователя.
+- Запуск локальной модели и модели эмбеддингов RAG требует предварительного
+  сканирования и явного выбора модели; сервер не подставляет «первую».
+- Ollama на ПК не автозапускается: ярлык `Ollama.lnk` отключён через
+  `StartupApproved` (Диспетчер задач → Автозагрузка). Запуск — вручную или
+  кнопкой «Запустить» в блоке «Модель эмбеддингов (RAG)».
+- Тест: `python -m tests.check_startup` (15 OK).
+
 ## 3. MCP
 
 Актуальные серверы:
@@ -103,6 +118,7 @@
 ```powershell
 python -m tests.check_project_help   # 79 OK
 python -m tests.check_embed          # 61 OK
+python -m tests.check_startup        # 15 OK
 python -m tests.check_pr_review      # 86 OK
 python -m tests.check_support        # 106 OK
 python -m tests.check_files          # 160 OK

@@ -1023,6 +1023,14 @@ def _active_label():
             else config.WEAK_LABEL)
 
 
+def _initial_engine():
+    """Движок при старте веб-сервера.
+
+    Всегда слабая модель VPS: сильную и RAG пользователь запускает сам.
+    """
+    return "weak"
+
+
 def _agent_api(path, payload=None, method="GET", timeout=None):
     """Обращается к служебному API ПК-агента (loopback VPS: AGENT_PORT)."""
     url = "http://%s:%d%s" % (config.AGENT_HOST, config.AGENT_PORT, path)
@@ -1226,6 +1234,49 @@ def _activate_weak():
             "model": model_name, "label": label}
 
 
+def _model_selection_error(model, scan, field="path"):
+    """Проверяет, что модель выбрана ПОСЛЕ сканирования.
+
+    Возвращает текст ошибки или "" если всё в порядке. Нужна, чтобы запуск
+    не подставлял «первую попавшуюся» модель: пользователь обязан сначала
+    просканировать папку и выбрать модель вручную.
+    """
+    model = str(model or "").strip()
+    if not model:
+        return ("Сначала просканируйте папку и выберите модель "
+                "(кнопка «Сканировать»).")
+    items = (scan or {}).get("models") or []
+    if not items:
+        return ("Нет результатов сканирования — нажмите «Сканировать» "
+                "и выберите модель.")
+    values = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in (field, "path", "name"):
+            val = str(item.get(key) or "").strip()
+            if val:
+                values.add(val)
+    if model not in values:
+        return ("Выбранная модель отсутствует в последнем скане — "
+                "обновите скан и выберите модель.")
+    return ""
+
+
+def _next_engine_on_tick(alive, engine):
+    """Политика фонового контроля туннеля.
+
+    * обрыв туннеля при активной сильной -> слабая (безопасный возврат);
+    * восстановление туннеля НЕ переключает на сильную, если не включено
+      ``config.AUTO_STRONG``: выбор модели — за пользователем.
+    """
+    if not alive and engine == "strong":
+        return "weak"
+    if alive and engine == "weak" and getattr(config, "AUTO_STRONG", False):
+        return "strong"
+    return engine
+
+
 def _tunnel_tick_loop(interval, stop_event):
     """Фоновый контроль туннеля: авто-возврат слабая <-> сильная."""
     print("[TUNNEL] фоновый контроль туннеля: каждые %d c." % interval,
@@ -1238,13 +1289,14 @@ def _tunnel_tick_loop(interval, stop_event):
                 probe = _tunnel_probe()
                 alive = bool(probe.get("alive"))
                 eng = _ServerState.local_engine
-                if not alive and eng == "strong":
+                next_eng = _next_engine_on_tick(alive, eng)
+                if next_eng == "weak" and eng == "strong":
                     print("[TUNNEL] обрыв туннеля — авто-возврат на слабую "
                           "(%s)" % config.WEAK_LABEL, flush=True)
                     _activate_weak()
-                elif alive and eng == "weak":
-                    print("[TUNNEL] туннель восстановлен — авто-возврат на "
-                          "сильную (%s)" % config.STRONG_LABEL, flush=True)
+                elif next_eng == "strong" and eng == "weak":
+                    print("[TUNNEL] восстановлен — переключение на сильную "
+                          "(%s)" % config.STRONG_LABEL, flush=True)
                     _activate_strong()
         except Exception as exc:                   # noqa: BLE001
             print("[TUNNEL] ошибка контроля: %s" % exc, flush=True)
@@ -3259,6 +3311,29 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         models_dir = str(data.get("models_dir")
                          or settings.get("models_dir") or "").strip()
 
+        # Запуск — только по модели, выбранной ПОСЛЕ сканирования.
+        scan = (_ServerState.pc_embed_scan if source == "pc"
+                else _ServerState.embed_scan) or {}
+        scan_models = [m for m in (scan.get("models") or [])
+                       if isinstance(m, dict)]
+        names = [str(m.get("name") or "") for m in scan_models
+                 if m.get("name")]
+        if not model:
+            return self._send_json(400, {
+                "ok": False, "scan_required": True,
+                "error": "Сначала просканируйте папку и выберите модель "
+                         "эмбеддингов."})
+        if not names:
+            return self._send_json(400, {
+                "ok": False, "scan_required": True,
+                "error": "Нет результатов сканирования — нажмите "
+                         "«Сканировать» и выберите модель."})
+        if not any(ollama_server.same_model(model, n) for n in names):
+            return self._send_json(400, {
+                "ok": False, "scan_required": True,
+                "error": "Выбранная модель отсутствует в последнем скане — "
+                         "обновите скан."})
+
         if source == "pc":
             res = _agent_api("/embed/start",
                              {"root": root, "exe": exe,
@@ -3396,6 +3471,14 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                                         "pid": runtime.get("pid")}
                     return self._send_json(200, payload)
                 params = dict(data.get("params") or {})
+                # Запуск — только по явному выбору после сканирования.
+                model = str(params.get("model") or "").strip()
+                err = _model_selection_error(
+                    model, _ServerState.local_scan or {})
+                if err:
+                    return self._send_json(400, {
+                        "ok": False, "error": err,
+                        "scan_required": True})
                 server_path = str(data.get("server_path")
                                   or mgr.load_settings().get("server_path")
                                   or "").strip()
@@ -3520,11 +3603,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                             server_path = srv.get("path")
                             break
                 model = str(params.get("model") or "").strip()
-                if not model:
-                    models = scan.get("models") or []
-                    if models:
-                        model = models[0].get("path")
-                        params["model"] = model
+                err = _model_selection_error(model, scan)
+                if err:
+                    return self._send_json(400, {
+                        "ok": False, "error": err,
+                        "scan_required": True})
                 if not server_path or not model:
                     return self._send_json(400, {
                         "ok": False,
@@ -3686,10 +3769,11 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
     except Exception as exc:                       # noqa: BLE001
         print("[SESSION] gc-поток не запущен: %s" % exc, flush=True)
 
-    # ЛОКАЛЬНАЯ LLM С ПК: если туннель уже поднят — включаем сильную модель,
-    # иначе слабую. Фоновый контроль обеспечивает двусторонний авто-возврат.
+    # ЛОКАЛЬНАЯ LLM С ПК: по умолчанию активна ТОЛЬКО слабая модель VPS.
+    # Сильную модель пользователь включает сам (кнопка/действие в UI);
+    # при старте сервера авто-переключения на неё нет.
     try:
-        if _tunnel_probe().get("alive"):
+        if _initial_engine() == "strong":
             _activate_strong()
         else:
             _activate_weak()

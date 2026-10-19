@@ -482,6 +482,7 @@ EMBED_MODEL_HINTS = ("embed", "bge", "e5", "gte", "jina", "nomic",
 #   RTK_EMBED_TUNNEL_PORT=11435   loopback-порт Ollama ПК на VPS
 #   RTK_PC_EMBED_ROOT=e:/Models  корень моделей эмбеддингов на ПК
 #   RTK_EMBED_LOCAL_PORT=11434    локальный порт Ollama (VPS/ПК)
+#   RTK_AUTO_STRONG=0             не переключать weak->strong автоматически
 #   RAG_EMBED_URL=...             эндпоинт эмбеддингов (Ollama через туннель)
 #   RAG_EMBED_API=ollama          протокол эмбеддингов (ollama/openai)
 
@@ -570,6 +571,10 @@ WEAK_LABEL = _env_str("RTK_WEAK_LABEL", "Qwen-2B")
 STRONG_LABEL = _env_str("RTK_STRONG_LABEL", "Qwen-9B")
 CONFIRM_TIMEOUT = _env_int("RTK_CONFIRM_TIMEOUT", 120)
 TUNNEL_CHECK_PERIOD = _env_int("RTK_TUNNEL_CHECK_PERIOD", 20)
+# Автоматически переключать слабую модель на сильную при восстановлении
+# туннеля. По умолчанию ВЫКЛЮЧЕНО: модели запускает/выбирает пользователь.
+# Обратный авто-возврат на слабую при обрыве туннеля остаётся.
+AUTO_STRONG = _env_bool("RTK_AUTO_STRONG", False)
 AGENT_TIMEOUT = _env_int("RTK_AGENT_TIMEOUT", 2)
 TUNNEL_PROBE_TIMEOUT = _env_int("RTK_TUNNEL_PROBE_TIMEOUT", 2)
 

@@ -510,6 +510,7 @@ python tests/check_strategies.py       # стратегии (sliding/facts/branc
 python tests/check_auto_compact.py     # авто-сжатие через HTTP
 python tests/check_rag.py              # базовый RAG (чанки, индекс, промпт)
 python tests/check_embed.py            # модель эмбеддингов RAG (Ollama, reuse-first)
+python tests/check_startup.py          # weak по умолчанию, запуск моделей вручную
 python tests/check_rag_rank.py          # улучшенный RAG (гибрид/порог/rewrite/реранк)
 python tests/check_rag_citations.py     # источник/chunk_id, жёлтые цитаты, «не знаю»
 python tests/check_project_help.py      # RAG по docs/коду, git-инструменты, /help
