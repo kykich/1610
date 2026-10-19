@@ -1637,6 +1637,33 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
 .local-status.warn { color: #e0c07a; }
 .local-status.error { color: #f08a86; }
 
+/* ===== МОДЕЛЬ ЭМБЕДДИНГОВ RAG (Ollama) =====
+   Подблок внутри RAG: те же контролы, что у локальной модели, поэтому
+   переиспользуются .local-box/.local-status-row/.local-input. */
+.embed-box {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #3d4763;
+}
+.embed-head {
+    font-size: .72rem;
+    font-weight: 600;
+    color: #cfd8ea;
+}
+.embed-reuse {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: .68rem;
+    color: #e0c07a;
+    background: #2b3346;
+    border-radius: 6px;
+    padding: 5px 6px;
+    line-height: 1.35;
+    word-break: break-word;
+}
+.embed-reuse[hidden] { display: none; }
+
 /* ===== Доска (task5): таблица «событие ↔ курс валюты» ===== */
 .msg.a .board-table {
     width: 100%;

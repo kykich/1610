@@ -734,6 +734,9 @@ class SessionStore:
                     "docs_dir": config.RAG_DOCS_DIR,
                     "top_k": config.RAG_TOP_K,
                     "embed_model": config.RAG_EMBED_MODEL,
+                    "embed_dim": config.RAG_EMBED_DIM,
+                    "embed_backend": "ollama",
+                    "embed_mismatch": False,
                     "files": 0, "chunks": 0, "available": False,
                     "errors": []}
 

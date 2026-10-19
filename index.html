@@ -248,8 +248,47 @@
                         </div>
                         <span id="rag-status" class="rag-status">RAG выключен</span>
                         <span id="rag-embed-status" class="rag-status">эмбеддинги: Ollama ПК (туннель) — нет данных</span>
+
+                        <!-- МОДЕЛЬ ЭМБЕДДИНГОВ (Ollama): путь -> сканирование ->
+                             выбор модели -> запуск. Повторяет сценарий блока
+                             «Локальная модель», но для RAG: если Ollama уже
+                             запущена (трей/вручную), используется ОНА и новый
+                             процесс не поднимается (экономия памяти). -->
+                        <div class="local-box embed-box">
+                            <div class="embed-head">Модель эмбеддингов (RAG)</div>
+                            <label class="compact-label side-label">
+                                <span>корень папки</span>
+                                <input type="text" id="embed-root" class="gen-input local-input"
+                                       placeholder="e:/Models или /opt/models" maxlength="400">
+                            </label>
+                            <div class="local-status-row">
+                                <button id="embed-scan" type="button" class="btn-side">Сканировать</button>
+                                <button id="embed-status-btn" type="button" class="btn-side link">Статус</button>
+                            </div>
+                            <div id="embed-reuse" class="embed-reuse" hidden>
+                                <span id="embed-reuse-text"></span>
+                                <div class="local-status-row">
+                                    <button id="embed-use" type="button" class="btn-side primary">Использовать существующую</button>
+                                </div>
+                            </div>
+                            <label class="compact-label side-label">
+                                <span>сервер</span>
+                                <select id="embed-server" class="gen-input local-input"
+                                        title="Найденная Ollama (ollama.exe)"></select>
+                            </label>
+                            <label class="compact-label side-label">
+                                <span>модель</span>
+                                <select id="embed-model" class="gen-input local-input"
+                                        title="Модели Ollama: embedding-модели идут первыми"></select>
+                            </label>
+                            <div class="local-status-row">
+                                <button id="embed-start" type="button" class="btn-side primary">Запустить</button>
+                                <button id="embed-stop" type="button" class="btn-side link">Остановить</button>
+                            </div>
+                            <span id="embed-status" class="local-status">эмбеддинги: не проверены</span>
+                        </div>
                     </div>
-                                        <span class="side-note">модель эмбеддингов — Ollama nomic-embed-text-v2-moe; индексируются PDF (текст), README/docs и код</span>
+                    <span class="side-note">модель эмбеддингов выбирается в подблоке выше; RAG включается вручную. Если Ollama уже запущена — используется она, второй процесс не поднимается</span>
                 </div>
             </section>
 

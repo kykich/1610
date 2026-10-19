@@ -275,6 +275,11 @@ RAG_CTX_CAP = 6000
 RAG_MAX_PDF_MB = 100
 # Таймаут запроса к Ollama (секунд): эмбеддинги одного текста + прогрев модели.
 RAG_EMBED_TIMEOUT = 60
+# Протокол эмбеддингов: "ollama" (/api/embeddings, fallback /api/embed) либо
+# "openai" (/v1/embeddings) — на случай llama.cpp-сервера эмбеддингов.
+RAG_EMBED_API = "ollama"
+# Необязательный ключ доступа к серверу эмбеддингов (llama.cpp --api-key).
+RAG_EMBED_API_KEY = ""
 
 # --- RAG: ДОКУМЕНТЫ И КОД ПРОЕКТА (docs/Final_task.md, задача 1) ---
 # Кроме PDF индексируются ТЕКСТОВЫЕ файлы: README, папка docs и исходники.
@@ -427,6 +432,30 @@ LOCAL_START_TIMEOUT = 180
 # Сколько свободной видеопамяти (МБ) оставлять в запасе при автоподборе -ngl.
 LOCAL_VRAM_RESERVE_MB = 512
 
+# --- МОДЕЛЬ ЭМБЕДДИНГОВ RAG (Ollama на ПК/VPS) ---
+# Блок «Модель эмбеддингов» в левой колонке запускает/переиспользует Ollama
+# так же, как блок локальной модели запускает llama-server: путь -> скан ->
+# выбор модели -> запуск. Настройки движка хранятся ОТДЕЛЬНО от RAG: эмбеддинги
+# одни на сервер, а включение/выключение RAG не должно менять выбранную модель.
+EMBED_ENABLED = False
+# Файл настроек/состояния блока (в папке сессии).
+EMBED_SETTINGS_FILE = os.path.join(SESSION_DIR, "embed_model.json")
+# Адрес локальной Ollama (на ПК-агенте и на VPS).
+EMBED_LOCAL_HOST = "127.0.0.1"
+EMBED_LOCAL_PORT = 11434
+# Корень для поиска Ollama: на VPS — /opt/models, на ПК — e:/Models.
+EMBED_LOCAL_ROOT = "/opt/models"
+# Корень на ПК (скан/запуск через ПК-агент). Пусто -> RTK_PC_ROOT.
+EMBED_PC_ROOT = ""
+# Таймаут ожидания готовности Ollama после запуска (секунд).
+EMBED_START_TIMEOUT = 60
+# Если Ollama уже запущена (трей/вручную) — использовать её, новую не
+# поднимать (экономия ресурсов).
+EMBED_REUSE_RUNNING = True
+# Признаки embedding-моделей в имени (для пометки ДО запуска Ollama).
+EMBED_MODEL_HINTS = ("embed", "bge", "e5", "gte", "jina", "nomic",
+                     "mxbai", "arctic", "snowflake")
+
 
 # ===========================================================================
 # ENV-КОНФИГ (VPS / серверный режим)
@@ -451,7 +480,10 @@ LOCAL_VRAM_RESERVE_MB = 512
 #   RTK_TUNNEL_HOST/PORT          loopback-адрес движка ПК на VPS
 #   RTK_AGENT_HOST/PORT           loopback-адрес служебного API ПК-агента
 #   RTK_EMBED_TUNNEL_PORT=11435   loopback-порт Ollama ПК на VPS
+#   RTK_PC_EMBED_ROOT=e:/Models  корень моделей эмбеддингов на ПК
+#   RTK_EMBED_LOCAL_PORT=11434    локальный порт Ollama (VPS/ПК)
 #   RAG_EMBED_URL=...             эндпоинт эмбеддингов (Ollama через туннель)
+#   RAG_EMBED_API=ollama          протокол эмбеддингов (ollama/openai)
 
 
 def _env_str(name, default=""):
@@ -498,6 +530,7 @@ LOCAL_SETTINGS_FILE = os.path.join(SESSION_DIR, "local_model.json")
 RAG_SETTINGS_FILE = os.path.join(SESSION_DIR, "rag.json")
 RAG_INDEX_FILE = os.path.join(SESSION_DIR, "rag_index.db")
 RAG_IMAGES_DIR = os.path.join(SESSION_DIR, "rag_images")
+EMBED_SETTINGS_FILE = os.path.join(SESSION_DIR, "embed_model.json")
 
 # 0 — лимит выключен (локальный режим, одна общая сессия как раньше).
 MAX_SESSIONS = _env_int("RTK_MAX_SESSIONS", 0)
@@ -553,6 +586,18 @@ RAG_EMBED_URL = _env_str(
 RAG_EMBED_MODEL = _env_str("RAG_EMBED_MODEL", RAG_EMBED_MODEL)
 RAG_EMBED_DIM = _env_int("RAG_EMBED_DIM", RAG_EMBED_DIM)
 RAG_EMBED_TIMEOUT = _env_int("RAG_EMBED_TIMEOUT", RAG_EMBED_TIMEOUT)
+RAG_EMBED_API = _env_str("RAG_EMBED_API", RAG_EMBED_API)
+RAG_EMBED_API_KEY = _env_str("RAG_EMBED_API_KEY", RAG_EMBED_API_KEY)
+
+# --- Модель эмбеддингов RAG (Ollama) ---
+# Локальный порт Ollama на этом хосте (VPS или ПК-агент).
+EMBED_LOCAL_HOST = _env_str("RTK_EMBED_LOCAL_HOST", EMBED_LOCAL_HOST)
+EMBED_LOCAL_PORT = _env_int("RTK_EMBED_LOCAL_PORT", EMBED_LOCAL_PORT)
+# Корень для сканирования: VPS — /opt/models, ПК — e:/Models.
+EMBED_LOCAL_ROOT = _env_str("RTK_EMBED_LOCAL_ROOT", EMBED_LOCAL_ROOT)
+EMBED_PC_ROOT = _env_str("RTK_PC_EMBED_ROOT", EMBED_PC_ROOT or PC_ROOT)
+EMBED_START_TIMEOUT = _env_int("RTK_EMBED_START_TIMEOUT", EMBED_START_TIMEOUT)
+EMBED_REUSE_RUNNING = _env_bool("RTK_EMBED_REUSE_RUNNING", EMBED_REUSE_RUNNING)
 RAG_REWRITE = _env_bool("RAG_REWRITE", RAG_REWRITE)
 RAG_RERANK = _env_str("RAG_RERANK", RAG_RERANK)
 RAG_HYBRID = _env_bool("RAG_HYBRID", RAG_HYBRID)

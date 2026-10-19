@@ -434,8 +434,34 @@ class TunnelKeeper:
 # ---------------------------------------------------------------------------
 # Служебный HTTP-API агента (доступен VPS ТОЛЬКО через туннель)
 # ---------------------------------------------------------------------------
-def make_handler(args, state, engine=None):
+def make_handler(args, state, engine=None, embed=None):
     """Фабрика обработчика HTTP-API агента."""
+
+    def _embed_scan(root):
+        """Скан корня для моделей эмбеддингов (Ollama)."""
+        from rtk_app import ollama_server
+        result = ollama_server.scan_root(root)
+        models_dir = str(getattr(args, "ollama_models", "") or "").strip()
+        if models_dir:
+            result["models_dir"] = models_dir
+            result["models"] = ollama_server.list_models(models_dir)
+            if result["models"]:
+                result["ok"] = True
+        return result
+
+    def _under_embed_root(path):
+        """Разрешает exe/каталог только внутри embed-root (если задан)."""
+        root = str(getattr(args, "embed_root", "") or args.root or "")
+        if not root:
+            return True
+        try:
+            root = os.path.normcase(os.path.abspath(
+                os.path.expanduser(root)))
+            full = os.path.normcase(os.path.abspath(
+                os.path.expanduser(str(path or ""))))
+            return os.path.commonpath([root, full]) == root
+        except (TypeError, ValueError):
+            return False
 
     class _Handler(BaseHTTPRequestHandler):
         server_version = "rtk-pc-agent/1.0"
@@ -511,6 +537,30 @@ def make_handler(args, state, engine=None):
                 root = q.get("root") or args.root or ""
                 from urllib.parse import unquote
                 return self._send(200, _scan_folder(unquote(root)))
+            if path == "/embed/status":
+                st = embed.status() if embed is not None else {
+                    "running": False, "ready": False, "models": [],
+                    "loaded_models": [], "external": False, "pid": None,
+                    "url": None, "error": "менеджер Ollama недоступен"}
+                payload = {"ok": True, "alive": True}
+                payload.update(st or {})
+                payload["settings"] = (embed.load_settings()
+                                       if embed is not None else {})
+                payload["tunnel"] = {
+                    "ollama_port": args.ollama_port,
+                    "embed_port": args.embed_tunnel_port,
+                }
+                return self._send(200, payload)
+            if path == "/embed/scan":
+                q = {}
+                if "?" in self.path:
+                    for part in self.path.split("?", 1)[1].split("&"):
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            q[k] = v
+                from urllib.parse import unquote
+                root = (q.get("root") or args.embed_root or args.root or "")
+                return self._send(200, _embed_scan(unquote(root)))
             return self._send(404, {"ok": False, "error": "not found"})
 
         def do_POST(self):                         # noqa: N802
@@ -554,6 +604,51 @@ def make_handler(args, state, engine=None):
                 stopped = engine.stop()
                 return self._send(200, {"ok": True, "stopped": stopped,
                                         "engine": engine.status()})
+            if path == "/embed/scan":
+                data = self._read_json()
+                root = (data.get("root") or args.embed_root
+                        or args.root or "")
+                return self._send(200, _embed_scan(root))
+            if path == "/embed/start":
+                data = self._read_json()
+                if embed is None:
+                    return self._send(503, {"ok": False,
+                                            "error": "менеджер Ollama "
+                                                     "недоступен"})
+                root = (data.get("root") or args.embed_root
+                        or args.root or "")
+                exe = str(data.get("exe") or "").strip()
+                models_dir = str(data.get("models_dir") or "").strip()
+                if not exe or not models_dir:
+                    scan = _embed_scan(root)
+                    exe = exe or (scan.get("servers") or [{}])[0].get(
+                        "path") or ""
+                    models_dir = (models_dir or scan.get("models_dir")
+                                  or "")
+                if not exe or not os.path.isfile(exe):
+                    return self._send(400, {"ok": False,
+                                            "error": "ollama не найдена: %s"
+                                                     % exe})
+                if not _under_embed_root(exe):
+                    return self._send(400, {
+                        "ok": False,
+                        "error": "ollama вне разрешённой папки моделей"})
+                if models_dir and not _under_embed_root(models_dir):
+                    return self._send(400, {
+                        "ok": False,
+                        "error": "каталог моделей вне разрешённой папки"})
+                res = embed.start(exe=exe, models_dir=models_dir,
+                                  model=data.get("model"),
+                                  reuse=data.get("reuse", True))
+                code = 200 if (res.get("ok")
+                               or res.get("needs_choice")) else 400
+                return self._send(code, res)
+            if path == "/embed/stop":
+                if embed is None:
+                    return self._send(503, {"ok": False,
+                                            "error": "менеджер Ollama "
+                                                     "недоступен"})
+                return self._send(200, embed.stop())
             if path == "/confirm":
                 data = self._read_json()
                 state.set(bool(data.get("ok")))
@@ -588,6 +683,10 @@ def build_parser():
                    help="локальный порт Ollama ПК (0 — не пробрасывать)")
     p.add_argument("--embed-tunnel-port", type=int, default=11435,
                    help="loopback-порт Ollama на VPS (эмбеддинги RAG)")
+    p.add_argument("--embed-root", default="",
+                   help="корень для скана моделей эмбеддингов (напр. e:/Models)")
+    p.add_argument("--ollama-models", default="",
+                   help="явный каталог моделей Ollama (manifests+blobs)")
     p.add_argument("--start-timeout", type=int, default=180,
                    help="таймаут запуска llama-server на ПК (секунд)")
     p.add_argument("--root", default="",
@@ -623,6 +722,10 @@ def main(argv=None):
         print("  ollama-port = %d" % args.ollama_port)
         print("  embed-port  = %d" % args.embed_tunnel_port)
         print("  root        = %s" % (args.root or "(не задан)"))
+        print("  embed-root  = %s"
+              % (getattr(args, "embed_root", "") or "(= root)"))
+        print("  ollama-models = %s"
+              % (getattr(args, "ollama_models", "") or "(авто)"))
         if args.ollama_port:
             oll = _ollama_status(args.ollama_port)
             print("  ollama      = %s, моделей=%d"
@@ -636,9 +739,18 @@ def main(argv=None):
 
     stop = threading.Event()
     engine = _EngineKeeper(args.engine_port, args.start_timeout, args.root)
+    if not getattr(args, "embed_root", ""):
+        args.embed_root = args.root
+    try:
+        from rtk_app import ollama_server
+        embed = ollama_server.OllamaManager(
+            port=int(args.ollama_port or 11434))
+    except Exception as exc:                       # noqa: BLE001
+        embed = None
+        print("[PC-AGENT] менеджер Ollama недоступен: %s" % exc, flush=True)
 
     # 1) Служебный HTTP-API агента (loopback). VPS достучится только по туннелю.
-    handler = make_handler(args, state, engine)
+    handler = make_handler(args, state, engine, embed)
     httpd = ThreadingHTTPServer((args.bind, args.agent_port), handler)
     t_http = threading.Thread(target=httpd.serve_forever, daemon=True)
     t_http.start()

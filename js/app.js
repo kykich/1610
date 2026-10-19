@@ -2176,28 +2176,45 @@ import { apiGet, apiPost } from "./core/api.js";
                      rewrite: true, hybrid: true, hybrid_alpha: 0.6,
                      pool_mult: 6, min_score: 0, rerank: "none",
                      files: 0, chunks: 0, available: false,
-                     embed_model: "", updated: null,
+                     embed_model: "", embed_backend: "ollama",
+                     embed_url: "", embed_dim: 0,
+                     index_embed_model: "", index_embed_dim: null,
+                     embed_mismatch: false,
+                     updated: null,
                      embed_tunnel: null };
 
     // Статус Ollama-эмбеддингов (через туннель с ПК).
     function renderRagEmbedStatus() {
         if (!ragEmbedStatusEl) return;
+        var backend = ragState.embed_backend || "ollama";
+        var model = ragState.embed_model || "";
+        var dim = ragState.embed_dim;
         if (!ragState.enabled) {
-            ragEmbedStatusEl.textContent =
-                "эмбеддинги: RAG выключен — Ollama не используется";
+            var tail = backend === "none"
+                ? "эмбеддинги остановлены — запустите в блоке «Модель эмбеддингов»"
+                : (model ? "модель: " + model : "движок не выбран");
+            ragEmbedStatusEl.textContent = "RAG выключен (" + tail + ")";
             ragEmbedStatusEl.className = "rag-status";
             return;
         }
+        if (backend === "none") {
+            ragEmbedStatusEl.textContent =
+                "эмбеддинги не запущены — запустите модель в подблоке RAG";
+            ragEmbedStatusEl.className = "rag-status warn";
+            return;
+        }
         var t = ragState.embed_tunnel || {};
+        var suffix = (model ? " · " + model : "") +
+            (dim ? " · dim " + dim : "") +
+            (t.url ? " · " + t.url : "");
         if (t.alive) {
-            ragEmbedStatusEl.textContent = t.model_ready
-                ? "эмбеддинги: Ollama ПК (туннель) — доступна"
-                : "эмбеддинги: Ollama ПК доступна, но модели нет";
+            ragEmbedStatusEl.textContent = "эмбеддинги: " +
+                (t.model_ready ? "доступна" : "модель не найдена") + suffix;
             ragEmbedStatusEl.className = "rag-status " +
                 (t.model_ready ? "ok" : "warn");
         } else {
-            ragEmbedStatusEl.textContent =
-                "эмбеддинги: Ollama ПК (туннель) — недоступна";
+            ragEmbedStatusEl.textContent = "эмбеддинги недоступны" +
+                (t.error ? ": " + t.error : "") + suffix;
             ragEmbedStatusEl.className = "rag-status warn";
         }
     }
@@ -2219,9 +2236,14 @@ import { apiGet, apiPost } from "./core/api.js";
         }
         if (ragState.embed_model) parts.push("модель: " + ragState.embed_model);
         if (ragState.updated) parts.push("обновлён: " + ragState.updated);
+        if (ragState.embed_mismatch) {
+            parts.push("⚠ индекс собран другой моделью — переиндексируйте");
+        }
         if (extraText) parts.push(extraText);
         ragStatusEl.textContent = parts.join(" · ");
-        ragStatusEl.className = "rag-status " + (ragState.available ? "ok" : "warn");
+        ragStatusEl.className = "rag-status " +
+            (ragState.embed_mismatch ? "warn"
+                : (ragState.available ? "ok" : "warn"));
     }
 
     // Применяет состояние RAG, пришедшее от сервера.
@@ -2240,6 +2262,18 @@ import { apiGet, apiPost } from "./core/api.js";
         if (typeof d.chunks === "number") ragState.chunks = d.chunks;
         if (typeof d.available === "boolean") ragState.available = d.available;
         if (typeof d.embed_model === "string") ragState.embed_model = d.embed_model;
+        if (typeof d.embed_backend === "string") ragState.embed_backend = d.embed_backend;
+        if (typeof d.embed_url === "string") ragState.embed_url = d.embed_url;
+        if (typeof d.embed_dim === "number") ragState.embed_dim = d.embed_dim;
+        if (typeof d.index_embed_model === "string") {
+            ragState.index_embed_model = d.index_embed_model;
+        }
+        if (typeof d.index_embed_dim === "number") {
+            ragState.index_embed_dim = d.index_embed_dim;
+        }
+        if (typeof d.embed_mismatch === "boolean") {
+            ragState.embed_mismatch = d.embed_mismatch;
+        }
         if (d.embed_tunnel) ragState.embed_tunnel = d.embed_tunnel;
         if ("updated" in d) ragState.updated = d.updated;
         if (ragEnabledEl) ragEnabledEl.checked = ragState.enabled;
@@ -2386,6 +2420,387 @@ import { apiGet, apiPost } from "./core/api.js";
         ragClearBtn.addEventListener("click", function () {
             ragAction("clear");
             setStatus("RAG: индекс очищен.", "ok");
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // МОДЕЛЬ ЭМБЕДДИНГОВ RAG (Ollama) — подблок внутри блока RAG.
+    // Сценарий: путь -> «Сканировать» -> выбор сервера/модели -> «Запустить».
+    // Если Ollama уже запущена (трей/вручную), используется ОНА: второй
+    // процесс не поднимается. См. GET/POST /api/embed.
+    // ------------------------------------------------------------------
+    var embedRootEl = document.getElementById("embed-root");
+    var embedScanBtn = document.getElementById("embed-scan");
+    var embedStatusBtn = document.getElementById("embed-status-btn");
+    var embedReuseEl = document.getElementById("embed-reuse");
+    var embedReuseTextEl = document.getElementById("embed-reuse-text");
+    var embedUseBtn = document.getElementById("embed-use");
+    var embedServerSel = document.getElementById("embed-server");
+    var embedModelSel = document.getElementById("embed-model");
+    var embedStartBtn = document.getElementById("embed-start");
+    var embedStopBtn = document.getElementById("embed-stop");
+    var embedStatusEl = document.getElementById("embed-status");
+
+    var embedState = {
+        settings: {}, runtime: {}, models: [], servers: [],
+        pc_models: [], pc_scan: {}, source: "vps", active: {},
+        reuse_offer: null, models_dir: "",
+        tunnel: { host: "127.0.0.1", port: 11435 }
+    };
+
+    function embedModelLabel(m) {
+        var bits = [m.name || ""];
+        if (m.embedding) bits.push("embedding");
+        if (m.embedding_length) bits.push("dim " + m.embedding_length);
+        if (m.size_mb) bits.push(m.size_mb + " МБ");
+        return bits.join(" · ");
+    }
+
+    // Баннер «Ollama уже запущена — использовать её?».
+    function renderEmbedReuse() {
+        if (!embedReuseEl) return;
+        var offer = embedState.reuse_offer;
+        if (!offer || !offer.available) {
+            embedReuseEl.hidden = true;
+            return;
+        }
+        var text = "На " + (offer.external ? "ПК" : "VPS") +
+            " уже запущена Ollama";
+        if (offer.pid) text += " (PID " + offer.pid + ")";
+        text += ".";
+        if (offer.selected_model_present) {
+            text += " Модель " + offer.selected_model +
+                " доступна — использовать её без запуска второго процесса?";
+        } else if ((offer.embedding_models || []).length) {
+            text += " Выбранной модели нет; доступны embedding-модели: " +
+                offer.embedding_models.join(", ") + ".";
+        } else {
+            text += " Embedding-моделей не найдено — выберите модель вручную.";
+        }
+        if ((offer.loaded || []).length) {
+            text += " Уже в памяти: " + offer.loaded.join(", ") + ".";
+        }
+        if (embedReuseTextEl) embedReuseTextEl.textContent = text;
+        embedReuseEl.hidden = false;
+        if (embedUseBtn) {
+            embedUseBtn.disabled = !(offer.selected_model_present ||
+                (embedModelSel && embedModelSel.value));
+        }
+    }
+
+    function renderEmbedStatus(extraText) {
+        if (!embedStatusEl) return;
+        var rt = embedState.runtime || {};
+        var act = embedState.active || {};
+        var parts = [];
+        if (rt.running) {
+            parts.push("Ollama запущена" +
+                (rt.external ? " (внешний процесс" +
+                    (rt.pid ? ", PID " + rt.pid : "") + ")" : ""));
+            var model = act.model ||
+                (embedModelSel ? embedModelSel.value : "");
+            if (model) parts.push(model);
+            if (act.dim) parts.push("dim " + act.dim);
+            var src = act.source || embedState.source;
+            parts.push(src === "pc"
+                ? "через туннель :" + (embedState.tunnel.port || 11435)
+                : "127.0.0.1:" + (rt.port || 11434));
+            var loaded = (rt.models || []).filter(function (m) {
+                return m.loaded;
+            }).map(function (m) { return m.name; });
+            if (loaded.length) parts.push("в памяти: " + loaded.join(", "));
+            embedStatusEl.className = "local-status ok";
+        } else if (rt.error) {
+            parts.push("Ollama не запущена");
+            embedStatusEl.className = "local-status warn";
+        } else {
+            parts.push("эмбеддинги не запущены");
+            embedStatusEl.className = "local-status";
+        }
+        if (extraText) parts.push(extraText);
+        embedStatusEl.textContent = parts.join(" · ");
+    }
+
+    // Заполняет селекты сервера и модели (embedding-модели — первыми).
+    function fillEmbedSelects() {
+        if (embedServerSel) {
+            var cur = (embedState.settings || {}).exe ||
+                embedServerSel.value || "";
+            var servers = embedState.servers || [];
+            embedServerSel.innerHTML = "";
+            if (!servers.length) {
+                var o0 = document.createElement("option");
+                o0.value = "";
+                o0.textContent = "— ollama не найдена —";
+                embedServerSel.appendChild(o0);
+            }
+            servers.forEach(function (s) {
+                var o = document.createElement("option");
+                o.value = s.path || "";
+                o.textContent = (s.name || "ollama") + " — " + (s.path || "");
+                embedServerSel.appendChild(o);
+            });
+            if (cur) {
+                var has = Array.prototype.some.call(embedServerSel.options,
+                    function (o) { return o.value === cur; });
+                if (!has) {
+                    var oc = document.createElement("option");
+                    oc.value = cur;
+                    oc.textContent = cur;
+                    embedServerSel.appendChild(oc);
+                }
+                embedServerSel.value = cur;
+            } else if (embedServerSel.options.length) {
+                embedServerSel.selectedIndex = 0;
+            }
+        }
+        if (embedModelSel) {
+            var curM = (embedState.settings || {}).model ||
+                embedModelSel.value || "";
+            var models = embedState.models || [];
+            if (embedState.source === "pc" && !models.length) {
+                models = embedState.pc_models || [];
+            }
+            embedModelSel.innerHTML = "";
+            var seen = {};
+            models.forEach(function (m) {
+                if (!m || !m.name || seen[m.name]) return;
+                seen[m.name] = true;
+                var o = document.createElement("option");
+                o.value = m.name;
+                o.textContent = embedModelLabel(m);
+                embedModelSel.appendChild(o);
+            });
+            if (!models.length) {
+                var oe = document.createElement("option");
+                oe.value = "";
+                oe.textContent = "— моделей нет —";
+                embedModelSel.appendChild(oe);
+            }
+            if (curM) {
+                var hasM = Array.prototype.some.call(embedModelSel.options,
+                    function (o) { return o.value === curM; });
+                if (!hasM) {
+                    var om = document.createElement("option");
+                    om.value = curM;
+                    om.textContent = curM;
+                    embedModelSel.appendChild(om);
+                }
+                embedModelSel.value = curM;
+            } else if (embedModelSel.options.length) {
+                embedModelSel.selectedIndex = 0;
+            }
+        }
+        if (embedStartBtn) {
+            embedStartBtn.disabled = !(embedModelSel && embedModelSel.value);
+        }
+    }
+
+    // Применяет снимок блока эмбеддингов от сервера.
+    function applyEmbedState(d) {
+        if (!d) return;
+        if (d.settings) embedState.settings = d.settings;
+        if (d.runtime) embedState.runtime = d.runtime;
+        if (d.models) embedState.models = d.models;
+        if (d.servers) embedState.servers = d.servers;
+        if (d.pc_models) embedState.pc_models = d.pc_models;
+        if (d.pc_scan) embedState.pc_scan = d.pc_scan;
+        if (d.source) embedState.source = d.source;
+        if (d.active) embedState.active = d.active;
+        if ("reuse_offer" in d) embedState.reuse_offer = d.reuse_offer;
+        if (d.tunnel) embedState.tunnel = d.tunnel;
+        if (d.models_dir) embedState.models_dir = d.models_dir;
+        if (d.source === "pc" && (d.pc_models || []).length) {
+            embedState.models = d.pc_models;
+        }
+        if (d.pc_status && d.pc_status.running &&
+                (!embedState.runtime || !embedState.runtime.running)) {
+            embedState.runtime = d.pc_status;
+            if (d.pc_status.models) embedState.models = d.pc_status.models;
+        }
+        if (embedRootEl && document.activeElement !== embedRootEl) {
+            embedRootEl.value = (embedState.settings || {}).root || "";
+        }
+        fillEmbedSelects();
+        renderEmbedReuse();
+        renderEmbedStatus();
+
+        var start = d.start_result || d.pc_start_result || {};
+        if (start.ok) {
+            if (start.reused || start.already) {
+                setStatus("Используется уже запущенная Ollama — новый "
+                    + "процесс не запускался.", "ok");
+            } else {
+                setStatus("Ollama запущена: " + (start.model || "")
+                    + (start.dim ? " (dim " + start.dim + ")" : ""), "ok");
+            }
+            initRag();
+        } else if (start.needs_choice) {
+            setStatus(start.error || "Выберите embedding-модель из списка.",
+                "warn");
+        } else if (start.error) {
+            setStatus("Эмбеддинги: " + start.error, "error");
+        }
+        var stop = d.stop_result || {};
+        if (stop.external) {
+            setStatus(stop.error || "Внешняя Ollama используется как есть.",
+                "warn");
+        } else if (stop.stopped) {
+            setStatus("Ollama остановлена.", "ok");
+        }
+        if (d.check_result) {
+            if (d.check_result.ok) {
+                setStatus("Эмбеддинги: ок (dim " + d.check_result.dim + ")",
+                    "ok");
+            } else {
+                setStatus("Эмбеддинги недоступны: "
+                    + (d.check_result.error || "?"), "error");
+            }
+        }
+        if (d.pc_result && d.pc_result.error) {
+            setStatus("ПК-агент: " + d.pc_result.error, "error");
+        }
+        if (d.scan && (d.scan.errors || []).length) {
+            setStatus("Скан: " + d.scan.errors.join("; "), "warn");
+        }
+        if (d.error) setStatus("Эмбеддинги: " + d.error, "error");
+        if (refreshSections) refreshSections();
+    }
+
+    // Отправляет действие с моделью эмбеддингов на сервер.
+    function embedAction(action, extra, done) {
+        var payload = { action: action };
+        if (extra) {
+            Object.keys(extra).forEach(function (k) { payload[k] = extra[k]; });
+        }
+        return apiPost("/api/embed", payload)
+            .then(function (d) {
+                if (d) applyEmbedState(d);
+                if (done) done(d);
+                return d;
+            })
+            .catch(function (err) {
+                setStatus("Эмбеддинги: " + err.message, "error");
+                if (done) done(null);
+                return null;
+            });
+    }
+
+    function initEmbed() {
+        apiGet("/api/embed")
+            .then(function (d) { if (d) applyEmbedState(d); })
+            .catch(function () {});
+    }
+
+    // --- Обработчики блока «Модель эмбеддингов» ---
+    if (embedScanBtn) {
+        embedScanBtn.addEventListener("click", function () {
+            var root = embedRootEl ? embedRootEl.value.trim() : "";
+            embedScanBtn.disabled = true;
+            renderEmbedStatus("сканирую…");
+            embedAction("scan", { root: root },
+                function (d) {
+                    embedScanBtn.disabled = false;
+                    if (!d) return;
+                    var res = d.pc_result || d.scan || {};
+                    if (res.error) {
+                        setStatus("Скан: " + res.error, "error");
+                    } else {
+                        setStatus("Найдено моделей: " +
+                            ((res.models || []).length) + ", серверов: " +
+                            ((res.servers || []).length), "ok");
+                    }
+                });
+        });
+    }
+    if (embedStatusBtn) {
+        embedStatusBtn.addEventListener("click", function () {
+            embedStatusBtn.disabled = true;
+            renderEmbedStatus("проверяю…");
+            embedAction("status", {
+                source: embedState.source,
+                model: embedModelSel ? embedModelSel.value : ""
+            }, function () { embedStatusBtn.disabled = false; });
+        });
+    }
+    if (embedStartBtn) {
+        embedStartBtn.addEventListener("click", function () {
+            var root = embedRootEl ? embedRootEl.value.trim() : "";
+            var model = embedModelSel ? embedModelSel.value : "";
+            if (!model) {
+                setStatus("Сначала просканируйте папку и выберите модель "
+                    + "эмбеддингов.", "error");
+                return;
+            }
+            var pc = isPcPath(root) || embedState.source === "pc";
+            embedStartBtn.disabled = true;
+            renderEmbedStatus(pc ? "запускаю Ollama на ПК…"
+                : "запускаю Ollama…");
+            embedAction("start", {
+                root: root,
+                model: model,
+                exe: embedServerSel ? embedServerSel.value : "",
+                models_dir: embedState.models_dir || "",
+                source: pc ? "pc" : "vps",
+                reuse: true
+            }, function () { embedStartBtn.disabled = false; });
+        });
+    }
+    if (embedStopBtn) {
+        embedStopBtn.addEventListener("click", function () {
+            var root = embedRootEl ? embedRootEl.value.trim() : "";
+            embedStopBtn.disabled = true;
+            embedAction("stop", null, function () {
+                embedStopBtn.disabled = false;
+            });
+        });
+    }
+    if (embedUseBtn) {
+        embedUseBtn.addEventListener("click", function () {
+            var offer = embedState.reuse_offer || {};
+            var root = embedRootEl ? embedRootEl.value.trim() : "";
+            var model = offer.selected_model ||
+                (embedModelSel ? embedModelSel.value : "");
+            var pc = isPcPath(root) || embedState.source === "pc" ||
+                (!isPcPath(embedState.settings.root || "") &&
+                 embedState.source === "pc");
+            embedUseBtn.disabled = true;
+            embedAction("start", {
+                root: root,
+                model: model,
+                exe: embedServerSel ? embedServerSel.value : "",
+                models_dir: embedState.models_dir || "",
+                source: pc ? "pc" : "vps",
+                reuse: true
+            }, function () { embedUseBtn.disabled = false; });
+        });
+    }
+    if (embedRootEl) {
+        var saveEmbedRoot = function () {
+            var root = (embedRootEl.value || "").trim();
+            var source = isPcPath(root) ? "pc" : "vps";
+            embedState.source = source;
+            embedState.models = source === "pc"
+                ? (embedState.pc_models || []) : (embedState.models || []);
+            fillEmbedSelects();
+            embedAction("set", { root: root, source: source });
+        };
+        embedRootEl.addEventListener("blur", saveEmbedRoot);
+        embedRootEl.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") { e.preventDefault(); saveEmbedRoot(); }
+        });
+    }
+    if (embedServerSel) {
+        embedServerSel.addEventListener("change", function () {
+            embedAction("set", { exe: embedServerSel.value || "" });
+        });
+    }
+    if (embedModelSel) {
+        embedModelSel.addEventListener("change", function () {
+            embedAction("set", {
+                model: embedModelSel.value || "",
+                source: embedState.source
+            });
         });
     }
 
@@ -3003,7 +3418,9 @@ import { apiGet, apiPost } from "./core/api.js";
                            invState.invariants.length),
             mcp: !!(mcpState && (mcpState.enabled ||
                                  mcpState.composition_running)),
-            rag: !!(ragState && ragState.enabled && ragState.available),
+            rag: !!(ragState && ((ragState.enabled && ragState.available) ||
+                                 (embedState && embedState.runtime &&
+                                  embedState.runtime.running))),
             local: !!(localState && (localState.enabled ||
                                      localState.running)),
             summary: !!(compactState && parseInt(compactState.keep, 10) > 0),
@@ -3027,6 +3444,11 @@ import { apiGet, apiPost } from "./core/api.js";
     bus.emit("app:ready", {});
 
     loadSession();
+    // Начальное состояние блоков (иначе они заполняются только после
+    // первого действия пользователя).
+    initRag();
+    initLocal();
+    initEmbed();
 
     // Сторож сессии: следит за лимитом мест и завершением сессии.
     initSessionGuard();

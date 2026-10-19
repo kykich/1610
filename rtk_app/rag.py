@@ -61,6 +61,12 @@ __all__ = [
 # и того же файла приводили бы к гонке за индекс. Чтение (поиск) не блокируем.
 _index_lock = threading.Lock()
 
+# Кэш активной конфигурации эмбеддингов (блок «Модель эмбеддингов»).
+# Ключ включает mtime файла настроек и значения config.* — при смене движка
+# или monkeypatch в тестах конфигурация перечитывается.
+_embed_cfg_lock = threading.Lock()
+_embed_cfg_cache = {"key": None, "cfg": None}
+
 # Библиотека pypdf загружается лениво: без установленной библиотеки остальной
 # функционал RAG (настройки, статус) должен работать, а индексация — выдать
 # понятную ошибку.
@@ -96,55 +102,171 @@ def _clean_text(text):
     return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
-def embed_text(text, model=None, timeout=None):
-    """Считает вектор эмбеддинга для текста через локальную Ollama.
+def _embed_config():
+    """Активная конфигурация эмбеддингов (файл блока -> ENV-фолбэк).
 
-    Возвращает список float (длина RAG_EMBED_DIM) либо бросает исключение
-    при недоступности Ollama/модели. Запрос — /api/embeddings (один prompt).
+    Кэшируется по mtime файла настроек и значениям config.*: при смене
+    движка из UI или monkeypatch в тестах конфигурация перечитывается.
+    """
+    path = getattr(config, "EMBED_SETTINGS_FILE", "")
+    try:
+        mtime = (os.path.getmtime(path)
+                 if path and os.path.isfile(path) else None)
+    except OSError:
+        mtime = None
+    key = (path, mtime, config.RAG_EMBED_URL, config.RAG_EMBED_MODEL,
+           config.RAG_EMBED_DIM, getattr(config, "RAG_EMBED_API", "ollama"),
+           getattr(config, "RAG_EMBED_API_KEY", ""))
+    with _embed_cfg_lock:
+        if _embed_cfg_cache.get("key") == key:
+            return dict(_embed_cfg_cache.get("cfg") or {})
+    try:
+        from . import ollama_server
+        cfg = ollama_server.active_embed_config()
+    except Exception:                            # noqa: BLE001
+        cfg = {"backend": "ollama", "api": "ollama",
+               "url": config.RAG_EMBED_URL, "model": config.RAG_EMBED_MODEL,
+               "dim": config.RAG_EMBED_DIM,
+               "api_key": getattr(config, "RAG_EMBED_API_KEY", "")}
+    with _embed_cfg_lock:
+        _embed_cfg_cache["key"] = key
+        _embed_cfg_cache["cfg"] = dict(cfg)
+    return cfg
+
+
+def _alt_embed_endpoint(url):
+    """Парный эндпоинт на случай 404/405 у выбранного протокола."""
+    u = str(url or "").rstrip("/")
+    pairs = (
+        ("/api/embeddings", "/v1/embeddings"),
+        ("/v1/embeddings", "/api/embeddings"),
+        ("/api/embed", "/v1/embeddings"),
+    )
+    for a, b in pairs:
+        if u.endswith(a):
+            return u[:-len(a)] + b
+    return ""
+
+
+def _embed_payload(url, model, text):
+    """Тело запроса под выбранный эндпоинт (Ollama или OpenAI-совместимый)."""
+    u = str(url or "").rstrip("/")
+    if u.endswith("/v1/embeddings"):
+        return {"model": model, "input": text}
+    if u.endswith("/api/embed"):
+        return {"model": model, "input": [text]}
+    return {"model": model, "prompt": text}
+
+
+def _post_embed(url, payload, timeout, api_key=""):
+    """POST JSON к серверу эмбеддингов; возвращает разобранный ответ."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _extract_vector(data):
+    """Достаёт вектор из ответа Ollama/OpenAI."""
+    if not isinstance(data, dict):
+        return []
+    vec = data.get("embedding")
+    if isinstance(vec, list) and vec:
+        return vec
+    embeddings = data.get("embeddings")
+    if isinstance(embeddings, list) and embeddings:
+        first = embeddings[0]
+        if isinstance(first, list) and first:
+            return first
+    items = data.get("data")
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        vec = items[0].get("embedding")
+        if isinstance(vec, list) and vec:
+            return vec
+    return []
+
+
+def embed_text(text, model=None, timeout=None):
+    """Считает вектор эмбеддинга через активный движок (Ollama/OpenAI API).
+
+    Движок выбирается в блоке «Модель эмбеддингов» (Ollama на ПК/VPS).
+    Поддерживаются /api/embeddings, /api/embed и OpenAI-совместимый
+    /v1/embeddings. Возвращает список float либо бросает исключение при
+    недоступности сервера/модели.
     """
     text = _clean_text(text or "").strip()
     if not text:
         raise ValueError("пустой текст для эмбеддинга")
-    payload = {
-        "model": model or config.RAG_EMBED_MODEL,
-        "prompt": text,
-    }
-    req = urllib.request.Request(
-        config.RAG_EMBED_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    cfg = _embed_config()
+    if str(cfg.get("backend") or "").lower() == "none":
+        raise RuntimeError("эмбеддинги не запущены — запустите модель "
+                           "эмбеддингов в блоке RAG")
+    url = str(cfg.get("url") or "").strip()
+    if not url:
+        raise RuntimeError("адрес сервера эмбеддингов не задан")
+    use_model = str(model or cfg.get("model")
+                    or config.RAG_EMBED_MODEL).strip()
     timeout_val = timeout or config.RAG_EMBED_TIMEOUT
-    max_retries = 3
-    for attempt in range(max_retries):
+    api_key = str(cfg.get("api_key") or "")
+    payload = _embed_payload(url, use_model, text)
+
+    last_error = None
+    for attempt in range(3):
         try:
-            with urllib.request.urlopen(
-                    req, timeout=timeout_val) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            vec = data.get("embedding")
-            if not isinstance(vec, list) or not vec:
-                raise RuntimeError("Ollama не вернула эмбеддинг")
+            data = _post_embed(url, payload, timeout_val, api_key=api_key)
+            vec = _extract_vector(data)
+            if not vec:
+                raise RuntimeError("сервер эмбеддингов не вернул вектор")
             return [float(x) for x in vec]
         except urllib.error.HTTPError as exc:
-            if exc.code == 500 and attempt < max_retries - 1:
+            last_error = exc
+            # 404/405 — протокол не поддержан: пробуем парный эндпоинт.
+            if exc.code in (404, 405):
+                alt = _alt_embed_endpoint(url)
+                if alt:
+                    try:
+                        data = _post_embed(
+                            alt, _embed_payload(alt, use_model, text),
+                            timeout_val, api_key=api_key)
+                        vec = _extract_vector(data)
+                        if vec:
+                            return [float(x) for x in vec]
+                    except Exception as alt_exc:       # noqa: BLE001
+                        last_error = alt_exc
+                raise exc
+            if exc.code == 500 and attempt < 2:
                 time.sleep(2)
                 continue
             raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("эмбеддинг не получен")
 
 
 def embed_available(timeout=5):
     """Проверяет доступность модели эмбеддингов (без индексации).
 
-    Возвращает dict {ok, model, dim?, error?}. Используется кнопкой
-    «Проверить» и статусом блока RAG.
+    Возвращает dict {ok, model, dim?, backend, url, error?}. Используется
+    кнопкой «Проверить» и статусом блока RAG.
     """
+    cfg = _embed_config()
+    info = {"backend": cfg.get("backend"), "url": cfg.get("url"),
+            "model": cfg.get("model")}
+    if str(cfg.get("backend") or "").lower() == "none":
+        info.update({"ok": False, "error": "эмбеддинги не запущены"})
+        return info
     try:
         vec = embed_text("проверка", timeout=timeout)
-        return {"ok": True, "model": config.RAG_EMBED_MODEL, "dim": len(vec)}
+        info.update({"ok": True, "dim": len(vec), "error": None})
+        return info
     except Exception as exc:                     # noqa: BLE001
-        return {"ok": False, "model": config.RAG_EMBED_MODEL,
-                "error": str(exc)}
+        info.update({"ok": False, "error": str(exc)})
+        return info
+
 
 
 # ----------------------------------------------------------------------
@@ -657,7 +779,39 @@ class RagStore(object):
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_images_file ON images(file)")
+        # Метаданные индекса: какой моделью/размерностью он собран.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta ("
+            "key TEXT PRIMARY KEY,"
+            "value TEXT)")
         conn.commit()
+
+    # ---- метаданные индекса ----
+    @staticmethod
+    def _meta_set(conn, key, value):
+        """Записывает метаданные индекса (key/value)."""
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                     (str(key), "" if value is None else str(value)))
+
+    @staticmethod
+    def _meta_get(conn, key):
+        """Читает метаданные индекса (None, если нет)."""
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key=?",
+                               (str(key),)).fetchone()
+            return row[0] if row else None
+        except Exception:                          # noqa: BLE001
+            return None
+
+    def _index_dim(self):
+        """Размерность векторов ДЕЙСТВУЮЩЕГО индекса (meta -> активная)."""
+        try:
+            value = self._meta_get(self._conn(), "embed_dim")
+            if value:
+                return max(1, int(value))
+        except (TypeError, ValueError):
+            pass
+        return int(_embed_config().get("dim") or config.RAG_EMBED_DIM)
 
     # ---- настройки (JSON) ----
     def load_settings(self):
@@ -764,7 +918,9 @@ class RagStore(object):
                 pass
         if rerank is not None and str(rerank) in ("none", "llm"):
             s["rerank"] = str(rerank)
-        s["embed_model"] = config.RAG_EMBED_MODEL
+        # ВАЖНО: модель эмбеддингов больше НЕ берётся из config — она хранится
+        # в отдельном файле блока «Модель эмбеддингов» (см. ollama_server).
+        # Иначе смена движка затиралась бы при каждом изменении настроек RAG.
         s["chunk_chars"] = int(config.RAG_CHUNK_CHARS)
         self.save_settings(s)
         return s
@@ -819,12 +975,36 @@ class RagStore(object):
                         "error": "папка не найдена: %s" % docs_dir}
             conn = self._conn()
             files = self._doc_files(docs_dir)
+            embed_cfg = _embed_config()
+            current_model = str(embed_cfg.get("model") or "")
+            current_dim = int(embed_cfg.get("dim")
+                              or config.RAG_EMBED_DIM)
+            # Если индекс собран ДРУГОЙ моделью/размерностью — переиндексируем
+            # всё принудительно (mtime/size не помогут: текст тот же, а векторы
+            # несовместимы).
+            meta_model = (self._meta_get(conn, "embed_model") or "").strip()
+            meta_dim_raw = self._meta_get(conn, "embed_dim")
+            force_reindex = bool(
+                meta_model and current_model
+                and meta_model.split(":", 1)[0]
+                != current_model.split(":", 1)[0])
+            if meta_dim_raw:
+                try:
+                    force_reindex = (force_reindex
+                                     or int(meta_dim_raw) != current_dim)
+                except (TypeError, ValueError):
+                    pass
             report = {"ok": True, "docs_dir": docs_dir, "files": 0,
                       "chunks": 0, "skipped": 0, "unchanged": 0,
                       "images": 0, "errors": [],
-                      "embed_model": config.RAG_EMBED_MODEL}
+                      "embed_model": embed_cfg.get("model"),
+                      "embed_backend": embed_cfg.get("backend"),
+                      "embed_dim": current_dim,
+                      "forced_reindex": force_reindex}
             if not files:
                 return report
+            vec_dim = 0
+            rewritten = 0
             for path in files:
                 try:
                     mtime = os.path.getmtime(path)
@@ -835,7 +1015,8 @@ class RagStore(object):
                 row = conn.execute(
                     "SELECT mtime, size, chunks FROM files WHERE path=?",
                     (path,)).fetchone()
-                if row and abs(row[0] - mtime) < 1e-6 and row[1] == size \
+                if row and not force_reindex \
+                        and abs(row[0] - mtime) < 1e-6 and row[1] == size \
                         and not row[2] is None:
                     report["unchanged"] += 1
                     report["chunks"] += int(row[2] or 0)
@@ -904,6 +1085,9 @@ class RagStore(object):
                     break
                 self._replace_file(conn, path, mtime, size, chunks, vectors,
                                    None)
+                rewritten += 1
+                if vectors and not vec_dim:
+                    vec_dim = len(vectors[0])
                 if pdf:
                     report["images"] += self._store_images(conn, path)
                 report["files"] += 1
@@ -913,6 +1097,20 @@ class RagStore(object):
                           % (os.path.basename(path), len(chunks)), flush=True)
             settings["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
             self.save_settings(settings)
+            # Фиксируем модель/размерность ТОЛЬКО если реально перезаписали
+            # векторы: иначе при смене модели и неизменных файлах метаданные
+            # соврали бы, что индекс пересобран.
+            if report.get("ok") and rewritten:
+                dim = int(vec_dim or report.get("embed_dim")
+                          or config.RAG_EMBED_DIM)
+                report["embed_dim"] = dim
+                self._meta_set(conn, "embed_model",
+                               report.get("embed_model") or "")
+                self._meta_set(conn, "embed_dim", dim)
+                self._meta_set(conn, "embed_backend",
+                               report.get("embed_backend") or "")
+                self._meta_set(conn, "indexed_at", settings["updated"])
+                conn.commit()
             return report
         finally:
             _index_lock.release()
@@ -1114,6 +1312,10 @@ class RagStore(object):
             conn.execute("DELETE FROM images")
         except Exception:                        # noqa: BLE001
             pass
+        try:
+            conn.execute("DELETE FROM meta")
+        except Exception:                        # noqa: BLE001
+            pass
         conn.commit()
         # Удаляем файлы изображений (вся папка хранилища).
         try:
@@ -1156,8 +1358,9 @@ class RagStore(object):
         if not q_vecs:
             return []
         scored = []
+        index_dim = self._index_dim()
         for file, page, chunk, text, vec in rows:
-            v = _unpack_vector(vec, config.RAG_EMBED_DIM)
+            v = _unpack_vector(vec, index_dim)
             if not v:
                 continue
             cos = max((_cosine(qv, v) for qv in q_vecs), default=0.0)
@@ -1176,6 +1379,32 @@ class RagStore(object):
             h["cosine"] = round(h["cosine"], 4)
             h["lexical"] = round(h["lexical"], 4)
         return scored[:max(1, pool)]
+
+    def _embed_mismatch(self):
+        """Сверяет модель/размерность индекса с активным движком.
+
+        Возвращает {mismatch, index_model, index_dim, current_model,
+        current_dim}. Индекс без метаданных (старый) считается совместимым.
+        """
+        cfg = _embed_config()
+        try:
+            conn = self._conn()
+            idx_model = (self._meta_get(conn, "embed_model") or "").strip()
+            raw_dim = self._meta_get(conn, "embed_dim")
+            idx_dim = int(raw_dim) if raw_dim else 0
+        except Exception:                        # noqa: BLE001
+            idx_model, idx_dim = "", 0
+        cur_model = str(cfg.get("model") or "")
+        cur_dim = int(cfg.get("dim") or 0)
+        # Тег можно опустить: nomic-embed-text-v2-moe == ...:latest.
+        def _base(name):
+            return str(name or "").split(":", 1)[0]
+        mismatch = (bool(idx_model and cur_model
+                         and _base(idx_model) != _base(cur_model))
+                    or bool(idx_dim and cur_dim and idx_dim != cur_dim))
+        return {"mismatch": bool(mismatch), "index_model": idx_model,
+                "index_dim": idx_dim, "current_model": cur_model,
+                "current_dim": cur_dim}
 
     def search(self, query, top_k=None, docs_dir=None):
         """Ищет top-k фрагментов к запросу с гибридным скором.
@@ -1211,6 +1440,15 @@ class RagStore(object):
             rows = [r for r in rows if _under_root(r[0], docs_dir)]
         if not rows:
             return []
+        mismatch = self._embed_mismatch()
+        if mismatch.get("mismatch"):
+            raise RuntimeError(
+                "индекс собран другой моделью эмбеддингов (%s, dim %s), "
+                "сейчас активна %s (dim %s) — переиндексируйте базу"
+                % (mismatch.get("index_model") or "?",
+                   mismatch.get("index_dim") or "?",
+                   mismatch.get("current_model") or "?",
+                   mismatch.get("current_dim") or "?"))
         pool = max(1, k * max(1, pool_mult))
         hits = self._score_rows(rows, qs, settings, pool)
         if min_score > 0.0:
@@ -1282,6 +1520,8 @@ class RagStore(object):
         """
         settings = self.load_settings()
         conn = self._conn()
+        embed_cfg = _embed_config()
+        mismatch = self._embed_mismatch()
         try:
             chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         except Exception:                        # noqa: BLE001
@@ -1305,8 +1545,16 @@ class RagStore(object):
             "enabled": bool(settings.get("enabled")),
             "docs_dir": settings.get("docs_dir"),
             "top_k": settings.get("top_k"),
-            "embed_model": config.RAG_EMBED_MODEL,
-            "embed_dim": config.RAG_EMBED_DIM,
+            "embed_model": embed_cfg.get("model"),
+            "embed_dim": int(embed_cfg.get("dim")
+                             or config.RAG_EMBED_DIM),
+            "embed_backend": embed_cfg.get("backend"),
+            "embed_url": embed_cfg.get("url"),
+            "embed_source": embed_cfg.get("source"),
+            # Модель/размерность, которыми РЕАЛЬНО собран индекс.
+            "index_embed_model": mismatch.get("index_model"),
+            "index_embed_dim": mismatch.get("index_dim") or None,
+            "embed_mismatch": bool(mismatch.get("mismatch")),
             # Улучшенный поиск (показываем в UI).
             "rewrite": bool(settings.get("rewrite")),
             "hybrid": bool(settings.get("hybrid")),

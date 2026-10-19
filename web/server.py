@@ -119,6 +119,18 @@ JSON-API:
                               "models" — список моделей запущенного сервера;
                               "set"    — сохранить {enabled?, root?,
                                          server_path?, params?}.
+    GET  /api/embed         - состояние МОДЕЛИ ЭМБЕДДИНГОВ RAG (Ollama):
+                              {settings, runtime, models, servers, source,
+                               reuse_offer, active, tunnel}
+    POST /api/embed         - {action, …} -> Ollama для RAG (reuse-first):
+                              "scan"/"pc_scan" — корень {root};
+                              "start"/"pc_start" — {root?, model?, reuse?}:
+                                         если Ollama уже запущена, используется
+                                         она (второй процесс не поднимается);
+                              "stop"/"pc_stop" — только свой процесс;
+                              "status"/"check" — /api/tags, /api/ps, dim;
+                              "set" — сохранить {root?, exe?, models_dir?,
+                                         model?, source?, reuse?}.
     """
 import json
 import mimetypes
@@ -135,6 +147,7 @@ from rtk_app import config
 from rtk_app.agent import Agent
 from rtk_app import file_tasks
 from rtk_app import local_server
+from rtk_app import ollama_server
 from rtk_app import support as support_mod
 from rtk_app.session_store import SessionStore
 from web import session_manager as session_mgr
@@ -614,6 +627,14 @@ class _ServerState:
     local_runtime = None
     local_lock = threading.Lock()
 
+    # --- МОДЕЛЬ ЭМБЕДДИНГОВ RAG (Ollama) ---
+    # Менеджер Ollama (reuse-first: уже запущенную не дублирует).
+    embed_manager = None
+    # Кеш сканирования корня на VPS и на ПК.
+    embed_scan = None
+    pc_embed_scan = None
+    embed_lock = threading.Lock()
+
     # --- ЛОКАЛЬНАЯ LLM С ПК (SSH-ТУННЕЛЬ) ---
     # Активный движок: "weak" (Qwen-2B на VPS, 127.0.0.1:8080) либо
     # "strong" (Qwen-9B на ПК, виден как 127.0.0.1:TUNNEL_PORT).
@@ -750,6 +771,172 @@ def _local_status_payload():
     }
 
 
+# ---------------------------------------------------------------------------
+# МОДЕЛЬ ЭМБЕДДИНГОВ RAG (Ollama): reuse-first + скан/запуск (ПК или VPS)
+# ---------------------------------------------------------------------------
+def _embed_manager():
+    """Лениво создаёт менеджер Ollama (singleton)."""
+    if _ServerState.embed_manager is None:
+        _ServerState.embed_manager = ollama_server.OllamaManager()
+    return _ServerState.embed_manager
+
+
+def _is_pc_path(path):
+    """True, если путь похож на путь ПК (диск/UNC), а не на путь VPS."""
+    p = str(path or "").strip()
+    return bool(re.match(r"^[A-Za-z]:[\\/]", p) or p.startswith("\\\\"))
+
+
+def _embed_base_url(url=None):
+    """Базовый URL Ollama из эндпоинта эмбеддингов (/api/... или /v1/...)."""
+    u = str(url or "").rstrip("/")
+    for suffix in ("/api/embeddings", "/api/embed", "/v1/embeddings"):
+        if u.endswith(suffix):
+            return u[:-len(suffix)]
+    return u
+
+
+def _embed_url_for_source(source):
+    """Эндпоинт эмбеддингов для источника: ПК — туннель, VPS — localhost."""
+    if str(source or "").lower() == "pc":
+        return ollama_server.tunnel_url() + "/api/embeddings"
+    return ollama_server.server_url() + "/api/embeddings"
+
+
+def _record_embed_selection(res, source, root="", exe="", models_dir=""):
+    """Сохраняет активный движок эмбеддингов на ВПС (или локально)."""
+    settings = ollama_server.load_settings()
+    settings.update({
+        "enabled": True,
+        "managed": True,
+        "backend": "ollama",
+        "api": "ollama",
+        "url": _embed_url_for_source(source),
+        "model": str(res.get("model") or settings.get("model") or ""),
+        "dim": int(res.get("dim") or settings.get("dim")
+                   or config.RAG_EMBED_DIM),
+        "source": "pc" if str(source).lower() == "pc" else "vps",
+        "exe": exe or settings.get("exe") or "",
+        "models_dir": models_dir or settings.get("models_dir") or "",
+        "root": root or settings.get("root") or "",
+    })
+    ollama_server.save_settings(settings)
+    return settings
+
+
+def _embed_state_payload():
+    """Снимок блока «Модель эмбеддингов» для UI."""
+    mgr = _embed_manager()
+    settings = mgr.load_settings()
+    runtime = mgr.status()
+    pc_status = None
+    if str(settings.get("source") or "").lower() == "pc":
+        agent = _agent_api("/embed/status")
+        if agent.get("ok") or agent.get("alive"):
+            pc_status = agent
+            if agent.get("running"):
+                runtime = agent
+    scan = _ServerState.embed_scan or {}
+    pc = _ServerState.pc_embed_scan or {}
+    models = list(scan.get("models") or [])
+    servers = list(scan.get("servers") or [])
+    if not models and pc:
+        models = list(pc.get("models") or [])
+    if not servers and pc:
+        servers = list(pc.get("servers") or [])
+    active = ollama_server.active_embed_config()
+    reuse_offer = None
+    if runtime.get("running"):
+        selected = str(active.get("model") or settings.get("model") or "")
+        names = [m.get("name") for m in runtime.get("models") or []]
+        reuse_offer = {
+            "available": True,
+            "external": bool(runtime.get("external")),
+            "pid": runtime.get("pid"),
+            "url": runtime.get("url"),
+            "models": runtime.get("models") or [],
+            "embedding_models": [m.get("name")
+                                 for m in runtime.get("models") or []
+                                 if m.get("embedding")],
+            "selected_model_present": bool(
+                selected and any(ollama_server.same_model(selected, n)
+                                 for n in names)),
+            "selected_model": selected,
+            "loaded": [m.get("name")
+                       for m in runtime.get("models") or []
+                       if m.get("loaded")],
+        }
+    return {
+        "ok": True,
+        "settings": settings,
+        "runtime": runtime,
+        "pc_status": pc_status,
+        "models": models,
+        "servers": servers,
+        "models_dir": (scan.get("models_dir") or pc.get("models_dir")
+                       or settings.get("models_dir") or ""),
+        "pc_models": (pc.get("models") or []),
+        "pc_scan": pc,
+        "source": "pc" if settings.get("source") == "pc" else "vps",
+        "reuse_offer": reuse_offer,
+        "active": active,
+        "tunnel": {
+            "host": config.EMBED_TUNNEL_HOST,
+            "port": config.EMBED_TUNNEL_PORT,
+            "url": ollama_server.tunnel_url(),
+        },
+    }
+
+
+def _embed_scan_local(root):
+    """Скан корня на VPS (Ollama установлена локально)."""
+    mgr = _embed_manager()
+    settings = mgr.load_settings()
+    settings["root"] = str(root or settings.get("root") or "").strip()
+    settings["source"] = "vps"
+    mgr.save_settings(settings)
+    result = mgr.scan(settings["root"])
+    _ServerState.embed_scan = result
+    _ServerState.pc_embed_scan = None
+    return result
+
+
+def _embed_scan_pc(root):
+    """Скан корня НА ПК через служебный API агента."""
+    root = str(root or config.EMBED_PC_ROOT or config.PC_ROOT or "").strip()
+    res = _agent_api("/embed/scan", {"root": root}, method="POST",
+                     timeout=60)
+    if res.get("ok") or res.get("models") is not None:
+        _ServerState.pc_embed_scan = {
+            "root": res.get("root") or root,
+            "models": res.get("models") or [],
+            "servers": res.get("servers") or [],
+            "models_dir": res.get("models_dir") or "",
+            "errors": res.get("errors") or [],
+        }
+        _ServerState.embed_scan = None
+        settings = _embed_manager().load_settings()
+        settings["root"] = res.get("root") or root
+        settings["source"] = "pc"
+        _embed_manager().save_settings(settings)
+    return res
+
+
+def _wait_tunnel_embed(model=None, timeout=60):
+    """Ждёт, пока Ollama ПК станет видна на VPS через туннель."""
+    deadline = time.time() + int(timeout)
+    last = {}
+    while time.time() < deadline:
+        last = ollama_server.probe(ollama_server.tunnel_url(), timeout=3)
+        if last.get("alive"):
+            names = [m.get("name") for m in last.get("models") or []]
+            if not model or any(ollama_server.same_model(model, n)
+                                for n in names):
+                return last
+        time.sleep(1.0)
+    return last
+
+
 def _sync_agent_local():
     """Синхронизирует состав источников агента с локальной моделью.
 
@@ -865,8 +1052,22 @@ def _tunnel_probe(timeout=None):
 
 
 def _embed_probe(timeout=None):
-    """Проверяет Ollama-эмбеддинги ПК через туннель (GET /api/tags)."""
-    return local_server.probe_embed(timeout=timeout)
+    """Проверяет активный движок эмбеддингов (Ollama) — GET /api/tags."""
+    cfg = ollama_server.active_embed_config()
+    if str(cfg.get("backend") or "").lower() == "none":
+        return {"alive": False, "models": [], "model_ready": False,
+                "error": "эмбеддинги не запущены", "url": "",
+                "model": cfg.get("model")}
+    base = _embed_base_url(cfg.get("url")) or ollama_server.tunnel_url()
+    res = ollama_server.probe(base, timeout=timeout)
+    model = str(cfg.get("model") or "")
+    names = [m.get("name") for m in res.get("models") or []]
+    res["model_ready"] = bool(model and any(
+        ollama_server.same_model(model, n) for n in names))
+    res["model"] = model
+    res["backend"] = cfg.get("backend")
+    res["source"] = cfg.get("source")
+    return res
 
 
 def _rag_enabled_global():
@@ -910,7 +1111,9 @@ def _tunnel_payload(check_embed=None):
         "embed_alive": bool(embed.get("alive")),
         "embed_models": embed.get("models") or [],
         "embed_model_ready": bool(embed.get("model_ready")),
-        "embed_model": config.RAG_EMBED_MODEL,
+        "embed_model": embed.get("model") or config.RAG_EMBED_MODEL,
+        "embed_source": embed.get("source"),
+        "embed_backend": embed.get("backend"),
         "embed_url": embed.get("url"),
         "embed_error": embed.get("error"),
         "embed_port": config.EMBED_TUNNEL_PORT,
@@ -935,14 +1138,16 @@ def _pair_payload():
     identity = str(getattr(config, "TUNNEL_IDENTITY", "")
                    or "%USERPROFILE%\\.ssh\\rtk_pc")
     pc_root = str(getattr(config, "PC_ROOT", "") or "").strip()
+    embed_root = str(getattr(config, "EMBED_PC_ROOT", "") or "").strip()
     vps_arg = vps or "rtk@<IP-этого-VPS>"
     root_arg = (" --root \"%s\"" % pc_root) if pc_root else ""
+    embed_arg = (" --embed-root \"%s\"" % embed_root) if embed_root else ""
     command = (
         "python -m rtk_pc_agent --vps %s --identity \"%s\" "
         "--engine-port %d --tunnel-port %d --agent-port %d "
-        "--ollama-port %d --embed-tunnel-port %d%s"
+        "--ollama-port %d --embed-tunnel-port %d%s%s"
         % (vps_arg, identity, engine_port, tunnel_port, agent_port,
-           ollama_port, embed_port, root_arg))
+           ollama_port, embed_port, root_arg, embed_arg))
     script = (
         "$ErrorActionPreference = \"Stop\"\r\n"
         "python -m rtk_pc_agent `\r\n"
@@ -952,14 +1157,17 @@ def _pair_payload():
         "  --tunnel-port %d `\r\n"
         "  --agent-port %d `\r\n"
         "  --ollama-port %d `\r\n"
-        "  --embed-tunnel-port %d%s\r\n"
+        "  --embed-tunnel-port %d%s%s\r\n"
         % (vps_arg, identity, engine_port, tunnel_port, agent_port,
            ollama_port, embed_port,
-           (" `\r\n  --root \"%s\"" % pc_root) if pc_root else ""))
+           (" `\r\n  --root \"%s\"" % pc_root) if pc_root else "",
+           (" `\r\n  --embed-root \"%s\"" % embed_root)
+           if embed_root else ""))
     return {"vps": vps, "engine_port": engine_port, "tunnel_port": tunnel_port,
             "agent_port": agent_port, "ollama_port": ollama_port,
             "embed_port": embed_port, "identity": identity,
-            "root": pc_root, "command": command, "script": script}
+            "root": pc_root, "embed_root": embed_root,
+            "command": command, "script": script}
 
 
 def _activate_strong():
@@ -1453,6 +1661,10 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # Состояние блока ЛОКАЛЬНОЙ модели (llama.cpp/Ollama): настройки,
             # найденные модели/серверы, состояние процесса, URL сервера.
             return self._send_json(200, _local_status_payload())
+        if path == "/api/embed":
+            # Состояние блока «Модель эмбеддингов RAG» (Ollama): скан,
+            # reuse-предложение, активный движок, загруженные модели.
+            return self._send_json(200, _embed_state_payload())
         self._send_json(404, {"ok": False, "error": "Not Found"})
 
     def do_POST(self):
@@ -1509,6 +1721,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return self._handle_rag()
         if urllib.parse.urlparse(self.path).path == "/api/local":
             return self._handle_local()
+        if urllib.parse.urlparse(self.path).path == "/api/embed":
+            return self._handle_embed()
         self._send_json(404, {"ok": False, "error": "Not Found"})
 
     # ---------------- Статика ----------------
@@ -2937,6 +3151,192 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         # action == "state" и всё прочее — отдаём состояние.
         return self._send_json(200, self.session.rag_status())
 
+    def _handle_embed(self):
+        """Управление моделью эмбеддингов RAG (Ollama) — reuse-first.
+
+        Действия:
+            "state"/"status" — снимок блока (скан, runtime, active, reuse);
+            "scan"     — скан корня на VPS (Ollama установлена локально);
+            "pc_scan"  — скан корня на ПК через служебный API агента;
+            "start"    — запуск/переиспользование Ollama на VPS;
+            "pc_start" — запуск/переиспользование Ollama на ПК;
+            "stop"/"pc_stop" — остановка (только своего процесса);
+            "check"    — тестовый эмбеддинг выбранной модели (dim);
+            "set"      — сохранить root/exe/models_dir/model/source/reuse.
+        """
+        data = self._read_json_body() or {}
+        action = str(data.get("action", "state")).strip().lower()
+        with _ServerState.embed_lock:
+            if action in ("scan", "pc_scan"):
+                root = str(data.get("root") or "").strip()
+                settings = _embed_manager().load_settings()
+                if not root:
+                    root = str(settings.get("root") or "").strip()
+                if not root:
+                    root = (config.EMBED_PC_ROOT
+                            if settings.get("source") == "pc"
+                            else config.EMBED_LOCAL_ROOT)
+                # Путь вида e:/Models на VPS не существует -> скан через
+                # ПК-агент. На самом ПК (локальный запуск) он существует ->
+                # скан локально. Явный pc_scan всегда идёт через агент.
+                remote = (action == "pc_scan"
+                          or (_is_pc_path(root)
+                              and not os.path.isdir(root)))
+                if remote:
+                    res = _embed_scan_pc(root)
+                    payload = _embed_state_payload()
+                    payload["pc_result"] = res
+                    return self._send_json(200, payload)
+                res = _embed_scan_local(root)
+                payload = _embed_state_payload()
+                payload["scan"] = res
+                return self._send_json(200, payload)
+
+            if action in ("start", "pc_start"):
+                return self._embed_start(data, action == "pc_start")
+
+            if action in ("stop", "pc_stop"):
+                return self._embed_stop(action == "pc_stop")
+
+            if action == "check":
+                cfg = ollama_server.active_embed_config()
+                model = str(data.get("model") or cfg.get("model") or "")
+                base = _embed_base_url(cfg.get("url"))
+                payload = _embed_state_payload()
+                if not base:
+                    payload["check_result"] = {
+                        "ok": False, "model": model, "dim": 0,
+                        "error": "эмбеддинги не запущены"}
+                    return self._send_json(200, payload)
+                payload["check_result"] = ollama_server.probe_model(
+                    model, url=base,
+                    timeout=int(getattr(config, "RAG_EMBED_TIMEOUT", 60)))
+                return self._send_json(200, payload)
+
+            if action == "status":
+                payload = _embed_state_payload()
+                source = str(data.get("source")
+                             or payload.get("source") or "vps").lower()
+                if source == "pc":
+                    payload["pc_status"] = _agent_api("/embed/status")
+                if data.get("model"):
+                    cfg = ollama_server.active_embed_config()
+                    base = _embed_base_url(cfg.get("url"))
+                    if base:
+                        payload["check_result"] = ollama_server.probe_model(
+                            str(data.get("model")), url=base)
+                return self._send_json(200, payload)
+
+            if action == "set":
+                mgr = _embed_manager()
+                settings = mgr.load_settings()
+                for key in ("root", "exe", "models_dir", "model", "source",
+                            "reuse"):
+                    if key in data:
+                        settings[key] = data.get(key)
+                mgr.save_settings(settings)
+                return self._send_json(200, _embed_state_payload())
+
+            # action == "state" и всё прочее.
+            return self._send_json(200, _embed_state_payload())
+
+    def _embed_start(self, data, pc=False):
+        """Запуск эмбеддингов на ПК/VPS с переиспользованием запущенной Ollama."""
+        mgr = _embed_manager()
+        settings = mgr.load_settings()
+        root = str(data.get("root") or settings.get("root")
+                   or "").strip()
+        if not root:
+            root = (config.EMBED_PC_ROOT
+                    if (pc or settings.get("source") == "pc")
+                    else config.EMBED_LOCAL_ROOT)
+        pc = pc or (str(settings.get("source") or "") == "pc"
+                    and not os.path.isdir(root))
+        source = "pc" if pc else "vps"
+        model = str(data.get("model") or settings.get("model") or "").strip()
+        reuse = bool(data.get("reuse", True))
+        exe = str(data.get("exe") or settings.get("exe") or "").strip()
+        models_dir = str(data.get("models_dir")
+                         or settings.get("models_dir") or "").strip()
+
+        if source == "pc":
+            res = _agent_api("/embed/start",
+                             {"root": root, "exe": exe,
+                              "models_dir": models_dir, "model": model,
+                              "reuse": reuse},
+                             method="POST", timeout=180)
+            payload = _embed_state_payload()
+            payload["pc_start_result"] = res
+            if not res.get("ok"):
+                return self._send_json(200 if res.get("needs_choice")
+                                       else 400, payload)
+            chosen = str(res.get("model") or model or "").strip()
+            probe = _wait_tunnel_embed(chosen or None, timeout=60)
+            if not probe.get("alive"):
+                payload["ok"] = False
+                payload["error"] = (
+                    "Ollama на ПК запущена, но туннель %d недоступен — "
+                    "перезапустите ПК-агент с --ollama-port %d"
+                    % (config.EMBED_TUNNEL_PORT, config.OLLAMA_PORT))
+                return self._send_json(200, payload)
+            dim = res.get("dim")
+            if not dim:
+                for m in probe.get("models") or []:
+                    if ollama_server.same_model(m.get("name"), chosen):
+                        dim = m.get("embedding_length")
+                        break
+            _record_embed_selection({"model": chosen, "dim": dim}, "pc",
+                                    root=root, exe=exe,
+                                    models_dir=models_dir)
+            payload = _embed_state_payload()
+            payload["pc_start_result"] = res
+            return self._send_json(200, payload)
+
+        # VPS: локальный запуск/переиспользование.
+        if not exe or not models_dir:
+            scan = mgr.scan(root)
+            exe = exe or (scan.get("servers") or [{}])[0].get("path") or ""
+            models_dir = models_dir or scan.get("models_dir") or ""
+        settings.update({"root": root, "exe": exe,
+                         "models_dir": models_dir, "model": model,
+                         "source": "vps", "reuse": reuse})
+        mgr.save_settings(settings)
+        res = mgr.start(exe=exe, models_dir=models_dir, model=model,
+                        reuse=reuse)
+        payload = _embed_state_payload()
+        payload["start_result"] = res
+        if res.get("ok"):
+            _record_embed_selection(res, "vps", root=root, exe=exe,
+                                    models_dir=models_dir)
+            payload = _embed_state_payload()
+            payload["start_result"] = res
+            return self._send_json(200, payload)
+        return self._send_json(200 if res.get("needs_choice") else 400,
+                               payload)
+
+    def _embed_stop(self, pc=False):
+        """Остановка своего процесса Ollama; внешнюю не трогаем."""
+        settings = ollama_server.load_settings()
+        if not pc:
+            # settings.source=pc, но путь существует локально -> это локальный
+            # запуск (разработка на ПК), останавливаем свой процесс.
+            pc = (str(settings.get("source") or "") == "pc"
+                  and not os.path.isdir(settings.get("root") or ""))
+        if pc:
+            res = _agent_api("/embed/stop", {}, method="POST", timeout=60)
+        else:
+            res = _embed_manager().stop()
+        if not res.get("external"):
+            settings["enabled"] = False
+            settings["managed"] = True
+            settings["backend"] = "none"
+            settings["url"] = ""
+            ollama_server.save_settings(settings)
+        payload = _embed_state_payload()
+        payload["stop_result"] = res
+        payload["source"] = "pc" if pc else "vps"
+        return self._send_json(200, payload)
+
     def _handle_local(self):
         """Управление ЛОКАЛЬНОЙ моделью (llama.cpp / Ollama / LM Studio).
 
@@ -3144,6 +3544,22 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                     "/start",
                     {"server_path": server_path, "params": params},
                     method="POST", timeout=300)
+                if res.get("ok") and res.get("already"):
+                    # На ПК уже запущен движок — используем его, новый не
+                    # поднимаем. Показываем реальную модель и предупреждаем,
+                    # если она отличается от выбранной в UI.
+                    res["reused"] = True
+                    st = _agent_api("/status")
+                    eng = (st.get("engine") or {}) if isinstance(st, dict) else {}
+                    models = eng.get("models") or []
+                    if models:
+                        res["models"] = models
+                        res["model"] = models[0]
+                    requested = str(params.get("model") or "")
+                    if requested and res.get("model") and requested != res["model"]:
+                        res["model_mismatch"] = True
+                        res["requested_model"] = requested
+                    res["external"] = not bool(eng.get("pid"))
                 up = {}
                 if res.get("ok"):
                     # Ждём, пока движок ПК станет виден через туннель.
