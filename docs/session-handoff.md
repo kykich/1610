@@ -65,6 +65,27 @@
 - По умолчанию показывается diff; запись — только по явному `--apply` или
   `confirm=True` (для естественного чата — если не сказано «покажи diff»).
 
+## 2a. Модель эмбеддингов RAG (Ollama) — 19.10.2026
+
+- Новый блок в левой колонке (внутри RAG): **путь → «Сканировать» → выбор
+  модели → «Запустить»**. Работает с ПК (`e:/Models`, через ПК-агент) и VPS
+  (`/opt/models`).
+- Модели читаются из `manifests/blobs` Ollama (embedding-модели первыми),
+  поэтому список доступен до запуска сервера.
+- **Reuse-first:** если Ollama уже запущена (трей/вручную), используется она;
+  второй `ollama serve` не поднимается. Кнопка «Остановить» не трогает
+  внешний процесс.
+- Настройки движка — `session/embed_model.json` (`embed_url/model/dim/source`).
+  RAG по-прежнему включается **вручную**; старт эмбеддингов не включает RAG.
+- `rag.embed_text` читает активный движок, поддерживает `/api/embeddings`,
+  `/api/embed` и `/v1/embeddings`; в индексе хранится `embed_model/embed_dim`,
+  при смене модели UI показывает `embed_mismatch` и просит переиндексацию.
+- API: `GET/POST /api/embed` (`scan`, `pc_scan`, `start`, `pc_start`,
+  `stop`, `pc_stop`, `status`, `check`, `set`).
+- ПК-агент: новые флаги `--embed-root`, `--ollama-models`; эндпоинты
+  `/embed/scan|start|stop|status`. Для RAG обязателен `--ollama-port 11434`.
+- Тест: `python -m tests.check_embed` (61 OK).
+
 ## 3. MCP
 
 Актуальные серверы:
@@ -81,6 +102,7 @@
 
 ```powershell
 python -m tests.check_project_help   # 79 OK
+python -m tests.check_embed          # 61 OK
 python -m tests.check_pr_review      # 86 OK
 python -m tests.check_support        # 106 OK
 python -m tests.check_files          # 160 OK
@@ -157,12 +179,15 @@ python files_cli.py new adr "Выбор SQLite для RAG" --root C:\work\projec
   `qwen2.5-3b-instruct-q4_k_m.gguf`).
 - Сильная модель ПК: `Qwen-9B` через reverse-SSH (`18080`), ПК-агент из
   `rtk_pc_agent` (`18081`).
-- **RAG выключен**, проброс Ollama `11435` остановлен
-  (`--ollama-port 0`). При выключенном RAG приложение не опрашивает
-  Ollama: `/api/rag`, `/api/local`, `/help`, `/support`, `check`,
-  `reindex` не используют эмбеддинги; `reindex` возвращает 409.
-- Индекс RAG сохранён (89 файлов, 2486 чанков) — для будущего включения
-  нужно включить RAG и перезапустить ПК-агент с `--ollama-port 11434`.
+- **RAG включается вручную.** Движок эмбеддингов выбирается в подблоке
+  «Модель эмбеддингов (RAG)»: `e:/Models` → «Сканировать» →
+  `nomic-embed-text-v2-moe:latest` → «Запустить». Если Ollama уже запущена
+  (трей/вручную), используется ОНА — второй процесс не поднимается.
+- Для RAG ПК-агент должен пробрасывать Ollama:
+  `--ollama-port 11434 --embed-tunnel-port 11435 --embed-root "e:/Models"`.
+  При `--ollama-port 0` порта `11435` на VPS нет.
+- Индекс RAG (89 файлов, 2486 чанков, nomic 768) совместим с этой моделью —
+  переиндексация не нужна, пока модель/размерность не менялись.
 - Проверено: ручное переключение `Qwen-9B ↔ Qwen-2B`, авто-возврат при
   обрыве туннеля и авто-возврат на сильную при восстановлении; чат на
   обеих моделях; запуск/остановка модели ПК из единого блока UI.
