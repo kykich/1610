@@ -3910,9 +3910,9 @@ def main():
         # а недоступные модели покажут подсказку, как добавить ключ
         # (самодиагностика уже напечатана через rtk_web.py/key_check).
         api_key = ""
-        print("[!] Файл %s не найден. DeepSeek-flash в чате станет "
-              "недоступен до тех пор, пока вы не впишете ключ в apidpsk.txt."
-              % config.DS_KEY_FILE)
+        print("[!] Файл %s не найден. DeepSeek-flash станет доступен после "
+              "ввода ключа в блоке «Ключи облачных моделей» (только на время "
+              "сеанса) или после создания apidpsk.txt." % config.DS_KEY_FILE)
     args = sys.argv[1:]
     host, port = config.WEB_HOST, config.WEB_PORT
     if args and args[0].isdigit():
