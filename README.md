@@ -69,6 +69,26 @@ sk-ваш_ключ_из_deepseek
 
 > ⚠️ Файл `apidpsk.txt` добавлен в `.gitignore` и не должен попадать на GitHub.
 
+### Ввод ключа в интерфейсе (без файла)
+
+В левой колонке есть блок **«Ключи облачных моделей»**: поля для DeepSeek и
+GigaChat, кнопки «Проверить» и «Очистить ключи».
+
+- Ключ **живёт только в памяти вкладки**: перезагрузка страницы, закрытие окна
+  и «Новый разговор» его стирают — ключ нужно вводить заново.
+- На сервер ключ приходит в теле `POST /api/ask` (поле `keys`) и действует
+  только на время этого запроса; на диск (`session/`, `apidpsk.txt`,
+  `gigakey.txt`) он **не записывается**.
+- Форматы: DeepSeek — `sk-…` одной строкой; GigaChat — base64 от пары
+  `client_id:client_secret` (можно вставить и саму пару `id:secret` — сервер
+  закодирует её сам).
+- Пустое поле = используется файл (`apidpsk.txt` / `gigakey.txt`), если он
+  есть. Ключ из поля имеет приоритет над файловым.
+- `GET /api/keys` отдаёт только маску и признак наличия файла;
+  `POST /api/keys` с `{action:"check", provider, key}` проверяет вставленный
+  ключ по сети (DeepSeek — пробный запрос, GigaChat — получение OAuth-токена),
+  ничего не сохраняя.
+
 ## Запуск
 
 ```bash
@@ -518,6 +538,7 @@ python tests/check_pr_review.py         # AI-ревью PR: diff, RAG, пром�
 python tests/check_support.py           # поддержка: тикеты, MCP, FAQ/RAG, /support
 python tests/check_files.py             # файлы: sandbox, поиск, docs/new, /files
 python tests/check_mcp_auto.py          # автовыбор MCP-сервера моделью (git/files/support)
+python tests/check_session_keys.py      # ключи облачных моделей: память вкладки, /api/keys
 ```
 
 Каждый тест печатает `[OK]`/`[FAIL]` по проверкам и строку

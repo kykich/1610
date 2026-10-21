@@ -101,6 +101,29 @@
   кнопкой «Запустить» в блоке «Модель эмбеддингов (RAG)».
 - Тест: `python -m tests.check_startup` (15 OK).
 
+## 2c. Ключи облачных моделей — ввод в интерфейсе (21.10.2026)
+
+- В левой колонке появился блок **«Ключи облачных моделей»**: поля DeepSeek
+  (`sk-…`) и GigaChat (base64 `client_id:client_secret` или пара `id:secret`),
+  кнопки «Проверить» и «Очистить ключи».
+- Ключ **живёт только в памяти вкладки** (`js/features/keys.js`): ничего не
+  пишется в `localStorage`/`sessionStorage`/cookie. Перезагрузка страницы,
+  закрытие окна и «Новый разговор» стирают ключи — их нужно вводить заново.
+- На сервер ключи приходят в теле `POST /api/ask` (поле `keys`) и действуют
+  только на время запроса: `rtk_app/runtime_keys.py` хранит их в
+  `threading.local`, `do_POST` вызывает `runtime_keys.clear()` в `finally`.
+- Приоритет: ключ из интерфейса > `apidpsk.txt` / `gigakey.txt` (файлы —
+  резервный способ для VPS, CLI и GitHub Actions; ENV-переопределений нет).
+- `rtk_app/deepseek.py` и `rtk_app/gigachat.py` читают сессионный ключ
+  (`allow_session=True`); для проверки вставленного ключа — `allow_session=False`.
+  Кэш OAuth-токенов GigaChat теперь **по учётным данным** (хэш в ключе), а не
+  один на процесс.
+- API: `GET /api/keys` — наличие файлов и маски (полный ключ не отдаётся);
+  `POST /api/keys {action:"status"|"check", provider?, key?}` — проверка
+  вставленного ключа по сети (DeepSeek — пробный запрос, GigaChat — OAuth),
+  без сохранения.
+- Тест: `python -m tests.check_session_keys` (56 OK).
+
 ## 3. MCP
 
 Актуальные серверы:
@@ -123,8 +146,10 @@ python -m tests.check_pr_review      # 86 OK
 python -m tests.check_support        # 106 OK
 python -m tests.check_files          # 160 OK
 python -m tests.check_mcp_auto       # 51 OK
+python -m tests.check_session_keys   # 56 OK
 python -m tests.check_server_context # 7 OK
 node --check js/app.js
+node --check js/features/keys.js
 ```
 
 Запуск:
