@@ -1478,6 +1478,28 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
 }
 .mcp-status.ok { color: #7bd88f; }
 .mcp-status.error { color: #f08a86; }
+
+/* ===== Ключи облачных моделей (DeepSeek / GigaChat) ===== */
+/* Поля ввода ключей в левой колонке. Значения живут только в памяти
+   вкладки, на сервере не сохраняются и в ответах API не возвращаются. */
+.keys-box {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+}
+/* Поля ключей — во всю ширину блока (подпись сверху, поле снизу). */
+.keys-box .compact-label {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 3px;
+}
+.keys-input {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: inherit;
+}
 .mcp-tools {
     font-size: .64rem;
     color: #9aa2bd;

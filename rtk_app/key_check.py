@@ -15,11 +15,11 @@
 """
 import os
 
-from . import config, deepseek, gigachat
+from . import config, deepseek, gigachat, runtime_keys
 
 __all__ = ["STATUS_OK", "STATUS_MISSING", "STATUS_EMPTY", "STATUS_BAD_FORMAT",
            "STATUS_INVALID", "STATUS_SKIP", "ReportKey",
-           "check_all", "print_report"]
+           "check_all", "check_key", "print_report"]
 
 # --- Статусы проверки одной пары файл/модель ---
 STATUS_OK = "ok"
@@ -109,15 +109,19 @@ def _is_base64_shape(txt):
 # ---------------------------------------------------------------------------
 # Глубокие проверки (по сети)
 # ---------------------------------------------------------------------------
-def _probe_deepseek(path):
-    """Один запрос 'ping' к DeepSeek. -> (ok:bool|None, label:str)"""
-    key = _read_file(path) or ""
+def _probe_deepseek_text(key):
+    """Один запрос 'ping' к DeepSeek с ЯВНЫМ ключом. -> (ok:bool|None, label)."""
+    key = str(key or "").strip()
     try:
+        # allow_session=False: проверяем именно вставленный ключ, а не тот,
+        # который мог прийти в этом же запросе из интерфейса.
         res = deepseek.chat(key, [{"role": "user", "content": "hi"}],
-                            model=config.DS_MODELS[0])
-        if isinstance(res, dict) and res.get("content"):
-            return True, res["content"]
-        return False, "сервер вернул пустой ответ"
+                            model=config.DS_MODELS[0], max_tokens=1,
+                            allow_session=False)
+        # Успешный HTTP-ответ означает, что ключ принят: контент может быть
+        # пустым при max_tokens=1, поэтому наличие текста не требуем.
+        content = res.get("content") if isinstance(res, dict) else ""
+        return True, (content or "ответ получен")
     except Exception as exc:
         msg = str(exc)
         low = msg.lower()
@@ -128,12 +132,16 @@ def _probe_deepseek(path):
         return None, "не удалось проверить по сети: %s" % msg[:120]
 
 
-def _probe_gigachat_creds(path):
-    """Пробуем получить OAuth-токен GigaChat из креды. -> (ok|None, label)"""
+def _probe_deepseek(path):
+    """Проверка ключа DeepSeek из файла. -> (ok:bool|None, label:str)"""
+    return _probe_deepseek_text(_read_file(path) or "")
+
+
+def _probe_gigachat_text(basic):
+    """OAuth-токен GigaChat для ЯВНЫХ кредов. -> (ok|None, label)."""
     try:
-        # Внутренняя проверка доступа; если клиент не выставляет публичный
-        # метод, читаем ключ и пробуем токен (см. gigachat).
-        token = gigachat._get_access_token()
+        token = gigachat._get_access_token(basic=str(basic or "").strip(),
+                                           allow_session=False)
         return (True, "OAuth-токен получен") if token else (False, "нет токена")
     except Exception as exc:
         msg = str(exc)
@@ -142,6 +150,100 @@ def _probe_gigachat_creds(path):
                                   "authentication", "invalid", "forbidden")):
             return False, "учётные данные не приняты Сбером («%s»)" % msg[:100]
         return None, "не удалось проверить OAuth-токен: %s" % msg[:120]
+
+
+def _probe_gigachat_creds(path):
+    """Проверка OAuth-кредов GigaChat из файла. -> (ok|None, label)"""
+    return _probe_gigachat_text(_read_file(path) or "")
+
+
+# ---------------------------------------------------------------------------
+# Проверка ключа, ВСТАВЛЕННОГО пользователем (ничего не сохраняется)
+# ---------------------------------------------------------------------------
+def _key_result(provider, status, detail, hint, masked=""):
+    return {"ok": status == STATUS_OK, "provider": provider,
+            "status": status, "detail": detail, "hint": hint,
+            "masked": masked}
+
+
+def check_key(provider, text, network=True):
+    """Проверяет ключ, введённый в интерфейсе (на диск не пишется).
+
+    provider — "deepseek" | "gigachat";
+    network=False — только формат (без запросов к API).
+    Возвращает dict: {ok, provider, status, detail, hint, masked}.
+    """
+    provider = str(provider or "").strip().lower()
+    if provider == "deepseek":
+        try:
+            key = runtime_keys.normalize_deepseek(text)
+        except ValueError as exc:
+            return _key_result(provider, STATUS_BAD_FORMAT, str(exc),
+                               "Вставьте ключ DeepSeek одной строкой (sk-…).")
+        if not key:
+            return _key_result(provider, STATUS_EMPTY, "ключ не заполнен",
+                               "Вставьте ключ DeepSeek (sk-…).")
+        if not _deepseek_key_shape_ok(key):
+            return _key_result(
+                provider, STATUS_BAD_FORMAT, "непохоже на ключ DeepSeek",
+                "Ключ DeepSeek начинается с 'sk-' и содержит не менее "
+                "28 символов без пробелов.", runtime_keys.mask(key))
+        if not network:
+            return _key_result(provider, STATUS_SKIP,
+                               "формат в порядке (проверка сети отключена)",
+                               "", runtime_keys.mask(key))
+        ok, info = _probe_deepseek_text(key)
+        if ok:
+            return _key_result(provider, STATUS_OK,
+                               "ключ рабочий (пробный запрос прошёл)", "",
+                               runtime_keys.mask(key))
+        if ok is False:
+            return _key_result(
+                provider, STATUS_INVALID, info,
+                "Ключ не активен / неверен. Проверьте в кабинете DeepSeek, "
+                "что ключ жив и есть баланс.", runtime_keys.mask(key))
+        return _key_result(provider, STATUS_SKIP, info,
+                           "Если при чате DeepSeek отвечает 'Ошибка 401' — "
+                           "ключ неверен или не активен.",
+                           runtime_keys.mask(key))
+
+    if provider == "gigachat":
+        try:
+            basic = runtime_keys.normalize_gigachat(text)
+        except ValueError as exc:
+            return _key_result(provider, STATUS_BAD_FORMAT, str(exc),
+                               "Нужна base64-строка client_id:client_secret "
+                               "или сама пара id:secret.")
+        if not basic:
+            return _key_result(provider, STATUS_EMPTY,
+                               "учётные данные не заполнены",
+                               "Вставьте base64 client_id:client_secret.")
+        if not _is_base64_shape(basic):
+            return _key_result(
+                provider, STATUS_BAD_FORMAT, "непохоже на base64",
+                "Нужна base64 от client_id:client_secret (без пробелов и "
+                "переводов строк).", runtime_keys.mask(basic))
+        if not network:
+            return _key_result(provider, STATUS_SKIP,
+                               "формат в порядке (проверка сети отключена)",
+                               "", runtime_keys.mask(basic))
+        ok, info = _probe_gigachat_text(basic)
+        if ok:
+            return _key_result(provider, STATUS_OK,
+                               "учётные данные приняты (OAuth-токен получен)",
+                               "", runtime_keys.mask(basic))
+        if ok is False:
+            return _key_result(
+                provider, STATUS_INVALID, info,
+                "Сбер не принял client_id/secret. Проверьте: активны ли они, "
+                "верен ли формат, открыт ли доступ (белый список IP / "
+                "рус. контур).", runtime_keys.mask(basic))
+        return _key_result(provider, STATUS_SKIP, info,
+                           "Сеть могла быть недоступна. Если при чате "
+                           "GigaChat ошибка авторизации — пересоздайте ключ.",
+                           runtime_keys.mask(basic))
+
+    raise ValueError("provider: ожидается 'deepseek' или 'gigachat'")
 
 
 # ---------------------------------------------------------------------------

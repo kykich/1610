@@ -28,6 +28,45 @@
              использование (напр. включён MCP, есть инварианты/профили/память)
              — заголовок подсвечивается оливковым (см. CSS .side-sec.in-use). -->
         <aside class="side">
+            <!-- КЛЮЧИ ОБЛАЧНЫХ МОДЕЛЕЙ (DeepSeek / GigaChat).
+                 Живут ТОЛЬКО в памяти этой вкладки: ничего не пишем в
+                 localStorage/sessionStorage/cookie/файлы. Перезагрузка
+                 страницы, закрытие окна и «новый разговор» стирают ключи —
+                 их нужно вводить заново. Пустое поле = используется файл
+                 apidpsk.txt / gigakey.txt (если он есть). -->
+            <section class="side-sec" data-section="keys">
+                <button type="button" class="side-sec-head" aria-expanded="true">
+                    <span class="side-sec-caret">▾</span>
+                    <span class="side-sec-name">Ключи облачных моделей</span>
+                </button>
+                <div class="side-sec-body">
+                    <div class="keys-box">
+                        <label class="compact-label side-label">
+                            <span>DeepSeek</span>
+                            <input type="password" id="ds-key" class="gen-input keys-input"
+                                   autocomplete="off" spellcheck="false"
+                                   placeholder="sk-…">
+                        </label>
+                        <div class="mcp-status-row">
+                            <button id="ds-key-check" type="button" class="btn-side">Проверить</button>
+                            <span id="ds-key-status" class="mcp-status"></span>
+                        </div>
+                        <label class="compact-label side-label">
+                            <span>GigaChat</span>
+                            <input type="password" id="gc-key" class="gen-input keys-input"
+                                   autocomplete="off" spellcheck="false"
+                                   placeholder="base64 client_id:client_secret">
+                        </label>
+                        <div class="mcp-status-row">
+                            <button id="gc-key-check" type="button" class="btn-side">Проверить</button>
+                            <span id="gc-key-status" class="mcp-status"></span>
+                        </div>
+                        <button id="keys-clear" type="button" class="btn-side link">Очистить ключи</button>
+                    </div>
+                    <span class="side-note">ключи живут только в памяти вкладки: перезагрузка, закрытие окна и новый разговор их стирают; пустое поле — используется файл</span>
+                </div>
+            </section>
+
             <!-- Стратегия управления контекстом (взаимоисключающие) -->
             <section class="side-sec" data-section="strategy">
                 <button type="button" class="side-sec-head" aria-expanded="true">

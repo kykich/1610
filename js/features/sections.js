@@ -31,6 +31,7 @@ function sectionInUse(name, usage) {
         case "mcp":        return !!usage.mcp;
         case "rag":        return !!usage.rag;
         case "local":      return !!usage.local;
+        case "keys":       return !!usage.keys;
         case "summary":    return !!usage.summary;
         case "memory":     return !!usage.memory;
         default:           return false;

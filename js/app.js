@@ -10,6 +10,10 @@
 /* ---- Подключение модулей (рефакторинг на ES-модули) ------------- */
 import { initSections, autoFitSide } from "./features/sections.js";
 import { initSessionGuard } from "./features/sessionGuard.js";
+// Ключи облачных моделей (DeepSeek/GigaChat) — живут только в памяти
+// вкладки; см. features/keys.js.
+import { initClientKeys, clientKeysPayload, clearClientKeys,
+         hasClientKeys } from "./features/keys.js";
 import { bus, registry } from "./core/bus.js";
 // Общие DOM-утилиты берём из зависимого модуля core/dom.js
 // (одна реализация на всё приложение, без дублирования).
@@ -1671,6 +1675,10 @@ import { apiGet, apiPost } from "./core/api.js";
             models: selectedModelsPayload(),
             compact: getCompactPayload(),
             strategy: getStrategyPayload(),
+            // Ключи облачных моделей, введённые в блоке «Ключи облачных
+            // моделей»: живут только в памяти вкладки и действуют на время
+            // этого запроса (на сервере не сохраняются).
+            keys: clientKeysPayload(),
         };
 
         fetch("/api/ask", {
@@ -1750,6 +1758,9 @@ import { apiGet, apiPost } from "./core/api.js";
         resetTokenStats();
         resetModelStats();
         resetContextStats();
+        // Новый разговор стирает и ключи облачных моделей: они живут только
+        // в памяти вкладки (требование — вводить ключ заново).
+        clearClientKeys();
         render();
         renderTrace(null, null);
         // Новый разговор сбрасывает и состояние задачи (см. /api/newchat).
@@ -3423,6 +3434,7 @@ import { apiGet, apiPost } from "./core/api.js";
                                   embedState.runtime.running))),
             local: !!(localState && (localState.enabled ||
                                      localState.running)),
+            keys: hasClientKeys(),
             summary: !!(compactState && parseInt(compactState.keep, 10) > 0),
             memory: (function () {
                 var w = memWorkingBox ?
@@ -3449,6 +3461,8 @@ import { apiGet, apiPost } from "./core/api.js";
     initRag();
     initLocal();
     initEmbed();
+    // Ключи облачных моделей: поля + очистка при загрузке страницы.
+    initClientKeys();
 
     // Сторож сессии: следит за лимитом мест и завершением сессии.
     initSessionGuard();

@@ -131,6 +131,16 @@ JSON-API:
                               "status"/"check" — /api/tags, /api/ps, dim;
                               "set" — сохранить {root?, exe?, models_dir?,
                                          model?, source?, reuse?}.
+    GET  /api/keys          - ключи облачных моделей, введённые в браузере:
+                              {deepseek:{file,masked}, gigachat:{file,masked}}.
+                              Полные значения НИКОГДА не возвращаются.
+    POST /api/keys          - {action:"status"|"check", provider?, key?}:
+                              "status" — как GET;
+                              "check"  — проверить вставленный ключ по сети
+                                         (DeepSeek — пробный запрос, GigaChat —
+                                         OAuth-токен), ничего не сохраняя.
+                              Ключи из интерфейса приходят в /api/ask полем
+                              "keys" и действуют только на время запроса.
     """
 import json
 import mimetypes
@@ -144,6 +154,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from rtk_app import config
+from rtk_app import runtime_keys
 from rtk_app.agent import Agent
 from rtk_app import file_tasks
 from rtk_app import local_server
@@ -1410,6 +1421,33 @@ def _ensure_session():
     return _ServerState.session
 
 
+def _file_key_value(path):
+    """Первая значимая строка файла ключа ('' — файла нет/он пуст)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except Exception:                            # noqa: BLE001
+        return ""
+    return ""
+
+
+def _keys_status_payload():
+    """Статус ключей облачных моделей: наличие файлов и маски (без ключей)."""
+    ds = _file_key_value(config.DS_KEY_FILE)
+    gc = _file_key_value(config.GC_KEY_FILE)
+    return {
+        "ok": True,
+        # Ключи из интерфейса живут ТОЛЬКО в памяти вкладки и на сервере
+        # не сохраняются (см. rtk_app.runtime_keys).
+        "session_only": True,
+        "deepseek": {"file": bool(ds), "masked": runtime_keys.mask(ds)},
+        "gigachat": {"file": bool(gc), "masked": runtime_keys.mask(gc)},
+    }
+
+
 class WebRequestHandler(BaseHTTPRequestHandler):
     server_version = "MultiModelChat/1.0"
 
@@ -1659,6 +1697,9 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/heartbeat":
             hb = _ServerState._RTK_VPS_SESSIONS.heartbeat(self._sid)
             return self._send_json(200, {"ok": True, "session": hb})
+        if path == "/api/keys":
+            # Только наличие файлов и маски: полные ключи не отдаём никогда.
+            return self._send_json(200, _keys_status_payload())
         if path == "/api/model":
             return self._send_json(200, {
                 "ok": True,
@@ -1739,12 +1780,19 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return self._send_json(409, {"ok": False,
                 "error": "Сессия завершена. Откройте новую.",
                 "state": "offline"})
-        return self._do_POST()
+        try:
+            return self._do_POST()
+        finally:
+            # Ключи, введённые пользователем в интерфейсе, действуют ТОЛЬКО
+            # на время этого запроса и нигде не сохраняются.
+            runtime_keys.clear()
 
     def _do_POST(self):
         import urllib.parse
         if urllib.parse.urlparse(self.path).path == "/api/ask":
             return self._handle_ask()
+        if urllib.parse.urlparse(self.path).path == "/api/keys":
+            return self._handle_keys()
         if urllib.parse.urlparse(self.path).path == "/api/newchat":
             self.session.reset()
             return self._send_json(200, {"ok": True,
@@ -2117,6 +2165,52 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             "error": result.get("error"),
         }
 
+    @staticmethod
+    def _apply_session_keys(data):
+        """Кладёт ключи из тела запроса в ТЕКУЩИЙ поток (только на запрос).
+
+        Ключи нигде не сохраняются: их стирает do_POST в finally. Некорректные
+        значения игнорируются — модель тогда сообщит, что ключ не задан.
+        """
+        keys = data.get("keys") if isinstance(data, dict) else None
+        if not isinstance(keys, dict):
+            runtime_keys.clear()
+            return
+        try:
+            runtime_keys.set_keys(deepseek=keys.get("deepseek"),
+                                  gigachat=keys.get("gigachat"))
+        except (TypeError, ValueError) as exc:
+            runtime_keys.clear()
+            print("[KEYS] ключи из запроса не приняты: %s" % exc, flush=True)
+
+    def _handle_keys(self):
+        """GET/POST /api/keys — статус файлов и проверка вставленного ключа.
+
+        Ключ, присланный в "check", никуда не сохраняется: используется
+        только для одного пробного запроса к API.
+        """
+        data = self._read_json_body() or {}
+        action = str(data.get("action") or "status").strip().lower()
+        if action == "status":
+            return self._send_json(200, _keys_status_payload())
+        if action != "check":
+            return self._send_json(400, {
+                "ok": False, "error": "Неизвестное действие: %s" % action})
+        provider = str(data.get("provider") or "").strip().lower()
+        if provider not in ("deepseek", "gigachat"):
+            return self._send_json(400, {
+                "ok": False,
+                "error": "provider: ожидается 'deepseek' или 'gigachat'"})
+        from rtk_app import key_check
+        try:
+            result = key_check.check_key(provider, data.get("key"))
+        except Exception as exc:                 # noqa: BLE001
+            return self._send_json(200, {
+                "ok": False, "provider": provider, "status": "invalid",
+                "detail": str(exc)[:300], "hint": "", "masked": ""})
+        result["provider"] = provider
+        return self._send_json(200, result)
+
     def _handle_newchat(self, force_renew=False):
         """POST /api/newchat — новый разговор.
 
@@ -2154,6 +2248,9 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         data = self._read_json_body()
         if not data:
             return self._send_json(400, {"ok": False, "error": "Bad JSON."})
+        # Ключи облачных моделей, введённые в браузере: действуют только
+        # на время этого запроса (ничего не сохраняется).
+        self._apply_session_keys(data)
         question = str(data.get("question", "")).strip()
         # Выбор моделей пользователем: [{"label": "…", "temperature": 0.7}]
         selected = data.get("models")
@@ -2738,6 +2835,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         data = self._read_json_body()
         if not data:
             return self._send_json(400, {"ok": False, "error": "Bad JSON."})
+        # Ключи облачных моделей из интерфейса — только на этот запрос.
+        self._apply_session_keys(data)
         keep = data.get("keep", config.COMPACT_KEEP)
         try:
             keep = max(0, int(keep))

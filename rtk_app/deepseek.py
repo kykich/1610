@@ -5,14 +5,18 @@ top_p и repetition_penalty.
 import json
 import urllib.request
 
-from . import config
+from . import config, runtime_keys
 
 __all__ = ["chat"]
 
 
 def chat(api_key, messages, model=None, temperature=None, max_tokens=None,
-         top_p=None, repetition_penalty=None):
+         top_p=None, repetition_penalty=None, allow_session=True):
     """Отправляет сообщения, возвращает dict: content, prompt_tokens, completion_tokens.
+
+    allow_session=True — ключ, введённый пользователем в интерфейсе
+    (он живёт только на время запроса), имеет приоритет над файловым.
+    False — использовать только переданный api_key (проверка ключа).
 
     temperature — float или None; None означает «не передавать» (системное
     значение модели по умолчанию).
@@ -23,6 +27,14 @@ def chat(api_key, messages, model=None, temperature=None, max_tokens=None,
     """
     if not model:
         model = config.DS_MODELS[0]
+    if allow_session:
+        api_key = runtime_keys.deepseek_key(api_key)
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        raise ValueError(
+            "не задан ключ DeepSeek: вставьте его в блоке «Ключи облачных "
+            "моделей» (действует до перезагрузки страницы) или создайте "
+            "apidpsk.txt")
     headers = {
         "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
