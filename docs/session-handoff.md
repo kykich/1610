@@ -122,7 +122,11 @@
   `POST /api/keys {action:"status"|"check", provider?, key?}` — проверка
   вставленного ключа по сети (DeepSeek — пробный запрос, GigaChat — OAuth),
   без сохранения.
-- Тест: `python -m tests.check_session_keys` (56 OK).
+- Статусы и ошибки в левой колонке переносятся по словам (CSS `.mcp-status`
+  без `nowrap`/`ellipsis`), блок растёт и сдвигает следующий; текст ошибки
+  проверки ключа на сервере не обрезается до 120 символов (до 600), поэтому
+  причина (например, `CERTIFICATE_VERIFY_FAILED`) видна целиком.
+- Тест: `python -m tests.check_session_keys` (61 OK).
 
 ## 3. MCP
 
@@ -146,7 +150,7 @@ python -m tests.check_pr_review      # 86 OK
 python -m tests.check_support        # 106 OK
 python -m tests.check_files          # 160 OK
 python -m tests.check_mcp_auto       # 51 OK
-python -m tests.check_session_keys   # 56 OK
+python -m tests.check_session_keys   # 61 OK
 python -m tests.check_server_context # 7 OK
 node --check js/app.js
 node --check js/features/keys.js

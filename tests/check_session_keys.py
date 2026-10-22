@@ -239,6 +239,37 @@ def test_check_key():
           runtime_keys.current() == {"deepseek": "", "gigachat": ""})
 
 
+def test_long_error_detail():
+    section("5b. Длинный текст ошибки не обрезается (переносится в UI)")
+    original_gc = gigachat._get_access_token
+    original_ds = deepseek.chat
+
+    def boom_gc(*args, **kwargs):
+        raise RuntimeError("SSL: CERTIFICATE_VERIFY_FAILED " + "x" * 400)
+
+    def boom_ds(*args, **kwargs):
+        raise RuntimeError("network unreachable " + "y" * 400)
+
+    gigachat._get_access_token = boom_gc
+    deepseek.chat = boom_ds
+    try:
+        ok, info = key_check._probe_gigachat_text(GC_BASIC)
+        check("GigaChat: сетевой сбой -> статус None (не «неверные креды»)",
+              ok is None, str(ok))
+        check("GigaChat: detail не обрезан до 120 символов",
+              len(info) > 300, "длина %d" % len(info))
+        check("GigaChat: причина SSL видна в тексте",
+              "CERTIFICATE_VERIFY_FAILED" in info, info[:80])
+
+        ok, info = key_check._probe_deepseek_text(DS_KEY)
+        check("DeepSeek: сетевой сбой -> статус None", ok is None, str(ok))
+        check("DeepSeek: detail не обрезан до 120 символов",
+              len(info) > 300, "длина %d" % len(info))
+    finally:
+        gigachat._get_access_token = original_gc
+        deepseek.chat = original_ds
+
+
 class RecordingAgent(object):
     """Фейковый агент: запоминает, какие ключи были в потоке запроса."""
 
@@ -406,6 +437,7 @@ def main():
     test_deepseek_priority()
     test_gigachat_tokens()
     test_check_key()
+    test_long_error_detail()
     test_http()
     return finish("Проверка сессионных ключей облачных моделей")
 

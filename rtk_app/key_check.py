@@ -127,9 +127,11 @@ def _probe_deepseek_text(key):
         low = msg.lower()
         if any(t in low for t in ("401", "403", "unauthor", "authentication",
                                   "invalid", "forbidden")):
-            return False, "ключ отвергнут сервером («%s»)" % msg[:100]
-        # сетевые ошибки не означают невалидность -> None
-        return None, "не удалось проверить по сети: %s" % msg[:120]
+            return False, "ключ отвергнут сервером («%s»)" % msg[:300]
+        # сетевые ошибки (в т.ч. SSL) не означают невалидность -> None.
+        # Текст не обрезаем коротко: UI переносит его по словам, а полная
+        # причина (например, CERTIFICATE_VERIFY_FAILED) важна для диагноза.
+        return None, "не удалось проверить по сети: %s" % msg[:600]
 
 
 def _probe_deepseek(path):
@@ -148,8 +150,10 @@ def _probe_gigachat_text(basic):
         low = msg.lower()
         if any(t in low for t in ("401", "403", "denied", "unauthor",
                                   "authentication", "invalid", "forbidden")):
-            return False, "учётные данные не приняты Сбером («%s»)" % msg[:100]
-        return None, "не удалось проверить OAuth-токен: %s" % msg[:120]
+            return False, "учётные данные не приняты Сбером («%s»)" % msg[:300]
+        # Текст ошибки не обрезаем коротко: UI переносит его по словам, а
+        # полная причина (SSL-цепочка, таймаут, DNS) нужна для диагностики.
+        return None, "не удалось проверить OAuth-токен: %s" % msg[:600]
 
 
 def _probe_gigachat_creds(path):

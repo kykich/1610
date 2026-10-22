@@ -731,6 +731,7 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
     font-size: .68rem;
     color: #a7b0c6;
     font-style: italic;
+    overflow-wrap: anywhere;
 }
 .mem-rows {
     display: flex;
@@ -841,6 +842,8 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
     font-size: .64rem;
     color: #8a92a6;
     line-height: 1.3;
+    /* Длинные системные сообщения/URL переносятся, а не вылезают за колонку. */
+    overflow-wrap: anywhere;
 }
 .strat-btn {
     font: inherit;
@@ -1460,8 +1463,10 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
 }
 .mcp-status-row {
     display: flex;
-    align-items: center;
-    gap: 6px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    row-gap: 4px;
+    column-gap: 6px;
 }
 .mcp-status-row .btn-side {
     flex: 0 0 auto;
@@ -1469,12 +1474,18 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
     font-size: .7rem;
     padding: 5px 8px;
 }
+/* Статус/ошибка блока. Текст ПЕРЕНОСИТСЯ по словам (раньше был nowrap +
+   ellipsis — хвост сообщения терялся). flex-basis даёт тексту уйти на свою
+   строку в узкой колонке, overflow-wrap рвёт длинные токены (URL, SSL). */
 .mcp-status {
     font-size: .68rem;
     color: #8a92a6;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    line-height: 1.35;
+    min-width: 0;
+    flex: 1 1 140px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 .mcp-status.ok { color: #7bd88f; }
 .mcp-status.error { color: #f08a86; }
@@ -1583,6 +1594,7 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
     color: #8a92a6;
     line-height: 1.35;
     word-break: break-word;
+    overflow-wrap: anywhere;
 }
 .rag-status.ok { color: #7bd88f; }
 .rag-status.warn { color: #e0c07a; }
@@ -1654,6 +1666,7 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
     color: #8a92a6;
     line-height: 1.35;
     word-break: break-word;
+    overflow-wrap: anywhere;
 }
 .local-status.ok { color: #7bd88f; }
 .local-status.warn { color: #e0c07a; }
